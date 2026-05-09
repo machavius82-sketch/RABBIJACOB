@@ -1065,6 +1065,119 @@ const RSS_FEEDS = [
 const RSS_PROXY = 'https://api.allorigins.win/get?url=';
 const REFRESH_MS = 90 * 1000;
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1h
+
+// ====================================================================
+// BINANCE API — source primaire, CORS ouvert, gratuit, fiable
+// ====================================================================
+const BINANCE_BASE = 'https://api.binance.com/api/v3';
+
+// Mapping CoinGecko ID → Binance symbol
+const CG_TO_BINANCE = {
+  'bitcoin':'BTCUSDT','ethereum':'ETHUSDT','solana':'SOLUSDT',
+  'binancecoin':'BNBUSDT','ripple':'XRPUSDT','cardano':'ADAUSDT',
+  'avalanche-2':'AVAXUSDT','polkadot':'DOTUSDT','chainlink':'LINKUSDT',
+  'litecoin':'LTCUSDT','uniswap':'UNIUSDT','aave':'AAVEUSDT',
+  'cosmos':'ATOMUSDT','near-protocol':'NEARUSDT','injective-protocol':'INJUSDT',
+  'optimism':'OPUSDT','arbitrum':'ARBUSDT','fetch-ai':'FETUSDT',
+  'render-token':'RNDRUSDT','bittensor':'TAOUSDT','filecoin':'FILUSDT',
+  'internet-computer':'ICPUSDT','polkadot':'DOTUSDT','celestia':'TIAUSDT',
+  'sei-network':'SEIUSDT','aptos':'APTUSDT','sui':'SUIUSDT',
+  'maker':'MKRUSDT','curve-dao-token':'CRVUSDT','jito-governance-token':'JITOUST',
+  'jupiter':'JUPUSDT','pendle':'PENDLEUSDT','1inch':'1INCHUSDT',
+  'the-graph':'GRTUSDT','ocean-protocol':'OCEANUSDT','band-protocol':'BANDUSDT',
+  'stellar':'XLMUSDT','tron':'TRXUSDT','dogecoin':'DOGEUSDT',
+  'shiba-inu':'SHIBUSDT','pepe':'PEPEUSDT','ton-crystal':'TONUSDT',
+  'matic-network':'MATICUSDT','immutable-x':'IMXUSDT','starknet':'STRKUSDT',
+  'mantle':'MNTUSDT','okb':'OKBUSDT','hedera-hashgraph':'HBARUSDT',
+  'vechain':'VETUSDT','algorand':'ALGOUSDT','elrond-erd-2':'EGLDUSDT',
+};
+
+function getBinanceSymbol(cgId) {
+  return CG_TO_BINANCE[cgId] || (cgId.toUpperCase() + 'USDT');
+}
+
+// Top 50 coins à afficher (par ordre de market cap approximatif)
+const TOP_COINS_LIST = [
+  {id:'bitcoin',         sym:'BTC', name:'Bitcoin',          binance:'BTCUSDT'},
+  {id:'ethereum',        sym:'ETH', name:'Ethereum',         binance:'ETHUSDT'},
+  {id:'binancecoin',     sym:'BNB', name:'BNB',              binance:'BNBUSDT'},
+  {id:'solana',          sym:'SOL', name:'Solana',           binance:'SOLUSDT'},
+  {id:'ripple',          sym:'XRP', name:'XRP',              binance:'XRPUSDT'},
+  {id:'dogecoin',        sym:'DOGE',name:'Dogecoin',         binance:'DOGEUSDT'},
+  {id:'tron',            sym:'TRX', name:'TRON',             binance:'TRXUSDT'},
+  {id:'cardano',         sym:'ADA', name:'Cardano',          binance:'ADAUSDT'},
+  {id:'avalanche-2',     sym:'AVAX',name:'Avalanche',        binance:'AVAXUSDT'},
+  {id:'sui',             sym:'SUI', name:'Sui',              binance:'SUIUSDT'},
+  {id:'chainlink',       sym:'LINK',name:'Chainlink',        binance:'LINKUSDT'},
+  {id:'stellar',         sym:'XLM', name:'Stellar',          binance:'XLMUSDT'},
+  {id:'hedera-hashgraph',sym:'HBAR',name:'Hedera',           binance:'HBARUSDT'},
+  {id:'ton-crystal',     sym:'TON', name:'Toncoin',          binance:'TONUSDT'},
+  {id:'polkadot',        sym:'DOT', name:'Polkadot',         binance:'DOTUSDT'},
+  {id:'litecoin',        sym:'LTC', name:'Litecoin',         binance:'LTCUSDT'},
+  {id:'uniswap',         sym:'UNI', name:'Uniswap',          binance:'UNIUSDT'},
+  {id:'near-protocol',   sym:'NEAR',name:'NEAR Protocol',    binance:'NEARUSDT'},
+  {id:'aptos',           sym:'APT', name:'Aptos',            binance:'APTUSDT'},
+  {id:'internet-computer',sym:'ICP',name:'Internet Computer',binance:'ICPUSDT'},
+  {id:'render-token',    sym:'RNDR',name:'Render',           binance:'RNDRUSDT'},
+  {id:'injective-protocol',sym:'INJ',name:'Injective',       binance:'INJUSDT'},
+  {id:'optimism',        sym:'OP',  name:'Optimism',         binance:'OPUSDT'},
+  {id:'arbitrum',        sym:'ARB', name:'Arbitrum',         binance:'ARBUSDT'},
+  {id:'cosmos',          sym:'ATOM',name:'Cosmos',           binance:'ATOMUSDT'},
+  {id:'aave',            sym:'AAVE',name:'Aave',             binance:'AAVEUSDT'},
+  {id:'filecoin',        sym:'FIL', name:'Filecoin',         binance:'FILUSDT'},
+  {id:'matic-network',   sym:'MATIC',name:'Polygon',         binance:'MATICUSDT'},
+  {id:'celestia',        sym:'TIA', name:'Celestia',         binance:'TIAUSDT'},
+  {id:'fetch-ai',        sym:'FET', name:'Fetch.ai',         binance:'FETUSDT'},
+  {id:'bittensor',       sym:'TAO', name:'Bittensor',        binance:'TAOUSDT'},
+  {id:'maker',           sym:'MKR', name:'MakerDAO',         binance:'MKRUSDT'},
+  {id:'pendle',          sym:'PENDLE',name:'Pendle',         binance:'PENDLEUSDT'},
+  {id:'curve-dao-token', sym:'CRV', name:'Curve',            binance:'CRVUSDT'},
+  {id:'the-graph',       sym:'GRT', name:'The Graph',        binance:'GRTUSDT'},
+  {id:'vechain',         sym:'VET', name:'VeChain',          binance:'VETUSDT'},
+  {id:'algorand',        sym:'ALGO',name:'Algorand',         binance:'ALGOUSDT'},
+  {id:'immutable-x',     sym:'IMX', name:'Immutable X',      binance:'IMXUSDT'},
+  {id:'sei-network',     sym:'SEI', name:'Sei',              binance:'SEIUSDT'},
+  {id:'jupiter',         sym:'JUP', name:'Jupiter',          binance:'JUPUSDT'},
+];
+
+// Fetch prix en temps réel depuis Binance (1 seul appel pour tout)
+async function fetchBinancePrices() {
+  const symbols = JSON.stringify(TOP_COINS_LIST.map(c => c.binance));
+  const url = `${BINANCE_BASE}/ticker/24hr?symbols=${encodeURIComponent(symbols)}`;
+  const data = await fetchWithRetry(url);
+  return data;
+}
+
+// Fetch klines 90j depuis Binance pour 1 coin
+async function fetchBinanceKlines(binanceSymbol, days = 90) {
+  const url = `${BINANCE_BASE}/klines?symbol=${binanceSymbol}&interval=1d&limit=${days}`;
+  const data = await fetchWithRetry(url);
+  // Format Binance : [openTime, open, high, low, close, volume, ...]
+  return {
+    closes:  data.map(k => parseFloat(k[4])),
+    volumes: data.map(k => parseFloat(k[5])),
+    highs:   data.map(k => parseFloat(k[2])),
+    lows:    data.map(k => parseFloat(k[3])),
+  };
+}
+
+// Convertit les données Binance 24hr en format compatible avec le reste de l'app
+function binanceTo24hrFormat(bData, cgCoin) {
+  return {
+    price_change_percentage_24h_in_currency: parseFloat(bData.priceChangePercent),
+    price_change_percentage_7d_in_currency:  null, // pas dispo depuis Binance 24hr
+    price_change_percentage_30d_in_currency: null,
+    total_volume: parseFloat(bData.quoteVolume),
+    current_price: parseFloat(bData.lastPrice),
+    market_cap: cgCoin?.market_cap || 0,
+    market_cap_rank: cgCoin?.market_cap_rank || 999,
+    ath_change_percentage: cgCoin?.ath_change_percentage || 0,
+    ath: cgCoin?.ath || 0,
+    image: cgCoin?.image || `https://cdn.jsdelivr.net/gh/atomiclabs/cryptocurrency-icons@master/32/color/${(cgCoin?.symbol||'btc').toLowerCase()}.png`,
+    sparkline_in_7d: cgCoin?.sparkline_in_7d || null,
+  };
+}
+
 const STORAGE = {
   PORTFOLIO: 'crypto_portfolio_v4',
   WATCHLIST: 'crypto_watchlist_v3',
@@ -1327,21 +1440,55 @@ async function fetchGlobal() {
 
 async function fetchMarket() {
   try {
-    const cur = currency;
-    // sparkline=true : utilisé pour les mini-graphiques 7j et le calcul RSI dans les signaux
-    // Coût : ~50KB mais nécessaire pour ces deux fonctionnalités
-    const path = `/coins/markets?vs_currency=${cur}&order=market_cap_desc&per_page=50&page=1&sparkline=true&price_change_percentage=24h%2C7d%2C30d`;
-    const { data, fromCache } = await cgFetch(path, `market_${cur}`);
-    marketData = data.map(coin => ({ ...coin, score: computeScore(coin), _tc: null }));
-    // _tc = null invalide le cache technique — sera recalculé à la demande
-    if (fromCache) {
-      isStale = true;
-      setStatus('warning', 'Cache · ' + new Date().toLocaleTimeString('fr-FR'));
-    } else {
-      isStale = false;
-      dataAge = Date.now();
-      setStatus('ok', 'En direct · ' + new Date().toLocaleTimeString('fr-FR'));
+    // SOURCE PRIMAIRE : Binance (CORS ouvert, pas de limite, fonctionne partout)
+    const binanceData = await fetchBinancePrices();
+    const binanceMap = {};
+    binanceData.forEach(b => { binanceMap[b.symbol] = b; });
+
+    // Tenter CoinGecko en arrière-plan pour enrichir (mcap, ATH, images)
+    let cgEnrich = {};
+    try {
+      const cur = currency;
+      const path = `/coins/markets?vs_currency=${cur}&order=market_cap_desc&per_page=50&page=1&sparkline=true&price_change_percentage=24h%2C7d%2C30d`;
+      const { data } = await cgFetch(path, `market_${cur}`);
+      data.forEach(c => { cgEnrich[c.id] = c; });
+    } catch(e) {
+      // CoinGecko indisponible — on continue avec Binance seul
+      const cached = getCached(`market_${currency}`);
+      if (cached) cached.forEach(c => { cgEnrich[c.id] = c; });
     }
+
+    // Construire marketData depuis Binance + enrichissement CoinGecko si dispo
+    marketData = TOP_COINS_LIST.map(coinDef => {
+      const b = binanceMap[coinDef.binance];
+      const cg = cgEnrich[coinDef.id];
+      if (!b) return null;
+      const coin = {
+        id: coinDef.id,
+        symbol: coinDef.sym.toLowerCase(),
+        name: coinDef.name,
+        binance: coinDef.binance,
+        current_price: parseFloat(b.lastPrice),
+        price_change_percentage_24h_in_currency: parseFloat(b.priceChangePercent),
+        price_change_percentage_7d_in_currency: cg?.price_change_percentage_7d_in_currency ?? null,
+        price_change_percentage_30d_in_currency: cg?.price_change_percentage_30d_in_currency ?? null,
+        total_volume: parseFloat(b.quoteVolume),
+        market_cap: cg?.market_cap || 0,
+        market_cap_rank: cg?.market_cap_rank || coinDef.rank || 999,
+        ath_change_percentage: cg?.ath_change_percentage || 0,
+        ath: cg?.ath || 0,
+        image: cg?.image || `https://cdn.jsdelivr.net/gh/atomiclabs/cryptocurrency-icons@master/32/color/${coinDef.sym.toLowerCase()}.png`,
+        sparkline_in_7d: cg?.sparkline_in_7d || null,
+        _source: 'binance',
+      };
+      coin.score = computeScore(coin);
+      coin._tc = null;
+      return coin;
+    }).filter(Boolean);
+
+    isStale = false;
+    dataAge = Date.now();
+    setStatus('ok', 'En direct · ' + new Date().toLocaleTimeString('fr-FR'));
     renderMarketTable();
     populateCoinSelector();
     populateDcaSelector();
@@ -1356,7 +1503,7 @@ async function fetchMarket() {
     document.getElementById('marketTableWrap').innerHTML = `
       <div class="empty">
         Impossible de charger les données.<br>
-        Causes possibles : connexion internet, limite API CoinGecko (30 req/min sans clé), CORS sur certains contextes.
+        Vérifiez votre connexion internet.
         <br><button class="btn retry-btn" onclick="refreshAll()">Réessayer</button>
       </div>`;
     return false;
@@ -2075,18 +2222,30 @@ async function loadDeepData(coinIds) {
   });
   if (toLoad.length === 0) return;
 
-  // Batch de 3 par 3 avec 400ms entre chaque (CoinGecko rate limit)
+  // Batch de 3 par 3 avec 300ms entre chaque (Binance ~1200 req/min)
   for (let i = 0; i < toLoad.length; i += 3) {
     const batch = toLoad.slice(i, i + 3);
     await Promise.all(batch.map(async id => {
       try {
-        const { data } = await cgFetch(
-          `/coins/${id}/market_chart?vs_currency=${currency}&days=90&interval=daily`,
-          `deep90_${id}_${currency}`
-        );
-        if (!data?.prices?.length) return;
-        const closes  = data.prices.map(p => p[1]);
-        const volumes = data.total_volumes?.map(v => v[1]) || [];
+        // Binance klines — fiable, CORS ouvert
+        const coinDef = TOP_COINS_LIST.find(c => c.id === id);
+        const binanceSym = coinDef?.binance || getBinanceSymbol(id);
+        let closes, volumes;
+        try {
+          const klines = await fetchBinanceKlines(binanceSym, 200);
+          closes  = klines.closes;
+          volumes = klines.volumes;
+        } catch(binErr) {
+          // Fallback CoinGecko si Binance échoue
+          const { data } = await cgFetch(
+            `/coins/${id}/market_chart?vs_currency=${currency}&days=90&interval=daily`,
+            `deep90_${id}_${currency}`
+          );
+          if (!data?.prices?.length) return;
+          closes  = data.prices.map(p => p[1]);
+          volumes = data.total_volumes?.map(v => v[1]) || [];
+        }
+        if (!closes?.length) return;
 
         // Calculs fiables sur 90j
         const rsi   = computeRSI(closes, 14);
@@ -3099,8 +3258,17 @@ async function openCoinDetail(id) {
     if (cached && Date.now() - cached.ts < DEEP_TTL && cached.closes?.length >= 30) {
       prices = cached.closes;
     } else {
-      const { data } = await cgFetch(`/coins/${id}/market_chart?vs_currency=${currency}&days=90`, `chart_${id}_90_${currency}`);
-      prices = data.prices.map(p => p[1]);
+      // Source primaire : Binance klines (CORS ouvert)
+      try {
+        const coinDef = TOP_COINS_LIST.find(c => c.id === id);
+        const binanceSym = coinDef?.binance || getBinanceSymbol(id);
+        const klines = await fetchBinanceKlines(binanceSym, 200);
+        prices = klines.closes;
+      } catch(e) {
+        // Fallback CoinGecko
+        const { data } = await cgFetch(`/coins/${id}/market_chart?vs_currency=${currency}&days=90`, `chart_${id}_90_${currency}`);
+        prices = data.prices.map(p => p[1]);
+      }
       // Mettre à jour le deep cache
       if (!deepCache[id]) deepCache[id] = {};
       deepCache[id].closes = prices;
