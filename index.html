@@ -1157,6 +1157,36 @@ function setCached(key, data) {
   } catch (e) { console.warn('Cache write failed', e); }
 }
 
+// ====================================================================
+// PROXIES CORS — fallback si CoinGecko bloque l'origine
+// ====================================================================
+const CORS_PROXIES = [
+  null, // Essai direct d'abord
+  'https://api.allorigins.win/raw?url=',
+  'https://corsproxy.io/?',
+  'https://api.codetabs.com/v1/proxy?quest=',
+];
+
+async function fetchWithProxy(url, opts = {}) {
+  let lastErr;
+  for (const proxy of CORS_PROXIES) {
+    const fullUrl = proxy ? proxy + encodeURIComponent(url) : url;
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 12000);
+      const resp = await fetch(fullUrl, { ...opts, signal: ctrl.signal });
+      clearTimeout(timer);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const text = await resp.text();
+      return JSON.parse(text);
+    } catch (e) {
+      lastErr = e;
+      await new Promise(r => setTimeout(r, 600));
+    }
+  }
+  throw lastErr;
+}
+
 async function fetchWithRetry(url, opts = {}, retries = 2) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
@@ -1179,13 +1209,20 @@ async function cgFetch(path, cacheKey) {
   const url = `${CG_BASE}${path}`;
   const ck = cacheKey || path;
   try {
-    const data = await fetchWithRetry(url);
+    // Essai direct d'abord, puis proxies CORS si bloqué
+    let data;
+    try {
+      data = await fetchWithRetry(url);
+    } catch (directErr) {
+      console.warn(`Direct fetch blocked for ${path}, trying CORS proxies…`);
+      data = await fetchWithProxy(url);
+    }
     setCached(ck, data);
     return { data, fromCache: false };
   } catch (e) {
     const cached = getCached(ck);
     if (cached) {
-      console.warn(`API failed for ${path}, using cache`);
+      console.warn(`All proxies failed for ${path}, using cache`);
       return { data: cached, fromCache: true };
     }
     throw e;
@@ -1328,7 +1365,12 @@ async function fetchMarket() {
 
 async function fetchFng() {
   try {
-    const data = await fetchWithRetry(`${FNG_BASE}/?limit=8`);
+    let data;
+    try {
+      data = await fetchWithRetry(`${FNG_BASE}/?limit=8`);
+    } catch(e) {
+      data = await fetchWithProxy(`${FNG_BASE}/?limit=8`);
+    }
     setCached('fng', data);
     fngData = data.data;
     renderFng();
