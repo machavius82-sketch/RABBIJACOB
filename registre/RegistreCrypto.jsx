@@ -24,6 +24,7 @@ import {
   Pie,
   Cell,
   LineChart,
+  ReferenceLine,
 } from "recharts";
 
 /* ─────────────────────────── Constantes ─────────────────────────── */
@@ -56,6 +57,8 @@ const SERIES_COLORS = ["var(--s1)", "var(--s2)", "var(--s3)", "var(--s4)", "var(
 const OTHER_COLOR = "var(--s-other)";
 const MAX_SLICES = 7;
 
+const FNG_LABELS = { "Extreme Fear": "Peur extrême", Fear: "Peur", Neutral: "Neutre", Greed: "Avidité", "Extreme Greed": "Avidité extrême" };
+
 const VIEWS = [
   { id: "portefeuille", label: "Portefeuille", title: "Portefeuille", icon: "wallet" },
   { id: "marche", label: "Marché", title: "Marché", icon: "market" },
@@ -65,12 +68,13 @@ const VIEWS = [
 
 const PATHS = {
   top: (ccy) =>
-    `/coins/markets?vs_currency=${ccy}&order=market_cap_desc&per_page=100&page=1&sparkline=true&price_change_percentage=24h%2C7d`,
+    `/coins/markets?vs_currency=${ccy}&order=market_cap_desc&per_page=100&page=1&sparkline=true&price_change_percentage=24h%2C7d%2C30d%2C200d`,
   ids: (ccy, ids) =>
-    `/coins/markets?vs_currency=${ccy}&ids=${encodeURIComponent(ids.join(","))}&order=market_cap_desc&per_page=250&page=1&sparkline=true&price_change_percentage=24h%2C7d`,
+    `/coins/markets?vs_currency=${ccy}&ids=${encodeURIComponent(ids.join(","))}&order=market_cap_desc&per_page=250&page=1&sparkline=true&price_change_percentage=24h%2C7d%2C30d%2C200d`,
   history: (id, ccy, days) =>
     `/coins/${encodeURIComponent(id)}/market_chart?vs_currency=${ccy}&days=${days}${days > 90 ? "&interval=daily" : ""}`,
   search: (q) => `/search?query=${encodeURIComponent(q)}`,
+  sentiment: "https://api.alternative.me/fng/?limit=1",
   rates: () => "/exchange_rates",
 };
 
@@ -138,6 +142,19 @@ function fmtQty(v) {
 function fmtPlain(v, max = 12) {
   if (!isNum(v)) return "";
   return nf({ useGrouping: false, maximumFractionDigits: max }).format(v);
+}
+/** Premiers jours de mois compris entre t0 et t1 (graduations des graphiques longs). */
+function monthTicks(t0, t1) {
+  const out = [];
+  const d = new Date(t0);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(1);
+  d.setMonth(d.getMonth() + 1);
+  while (d.getTime() <= t1) {
+    out.push(d.getTime());
+    d.setMonth(d.getMonth() + 1);
+  }
+  return out;
 }
 function fmtDate(iso) {
   if (!iso) return "—";
@@ -332,25 +349,218 @@ function createClient() {
 const client = createClient();
 
 function normalizeCoin(c) {
-  const spark = (c.sparkline_in_7d && c.sparkline_in_7d.price) || [];
-  return {
+  const hourly = ((c.sparkline_in_7d && c.sparkline_in_7d.price) || []).filter(isNum);
+  const pct = (k) => (isNum(c[k]) ? c[k] : null);
+  const coin = {
     id: c.id,
     symbol: String(c.symbol || "").toUpperCase(),
     name: c.name || c.id,
     image: c.image || null,
     price: isNum(c.current_price) ? c.current_price : null,
-    change24h: isNum(c.price_change_percentage_24h_in_currency)
-      ? c.price_change_percentage_24h_in_currency
-      : isNum(c.price_change_percentage_24h)
-        ? c.price_change_percentage_24h
-        : null,
-    change7d: isNum(c.price_change_percentage_7d_in_currency) ? c.price_change_percentage_7d_in_currency : null,
-    mcap: isNum(c.market_cap) ? c.market_cap : null,
-    rank: isNum(c.market_cap_rank) ? c.market_cap_rank : null,
-    spark: downsample(spark.filter(isNum), 42).map((v) => ({ v })),
+    change24h: pct("price_change_percentage_24h_in_currency") ?? pct("price_change_percentage_24h"),
+    change7d: pct("price_change_percentage_7d_in_currency"),
+    change30d: pct("price_change_percentage_30d_in_currency"),
+    change200d: pct("price_change_percentage_200d_in_currency"),
+    ath: pct("ath"),
+    athChange: pct("ath_change_percentage"),
+    athDate: typeof c.ath_date === "string" ? c.ath_date : null,
+    mcap: pct("market_cap"),
+    rank: pct("market_cap_rank"),
+    rsi: rsiFromHourly(hourly),
+    spark: downsample(hourly, 42).map((v) => ({ v })),
   };
+  return withScore(coin);
 }
 const normalizeList = (data) => (Array.isArray(data) ? data.filter((c) => c && c.id).map(normalizeCoin) : []);
+
+/* ─────────────────────────── Score d'opportunité & seuils clés ─────────────────────────── */
+
+/** RSI de Wilder. */
+function computeRSI(closes, period = 14) {
+  if (!closes || closes.length < period + 1) return null;
+  let gain = 0;
+  let loss = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d >= 0) gain += d;
+    else loss -= d;
+  }
+  let avgGain = gain / period;
+  let avgLoss = loss / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    avgGain = (avgGain * (period - 1) + Math.max(d, 0)) / period;
+    avgLoss = (avgLoss * (period - 1) + Math.max(-d, 0)) / period;
+  }
+  if (avgLoss === 0) return avgGain === 0 ? 50 : 100;
+  return 100 - 100 / (1 + avgGain / avgLoss);
+}
+/** RSI 14 sur des bougies de 4 h reconstituées à partir des 168 cours horaires de la semaine. */
+function rsiFromHourly(hourly) {
+  const closes = hourly.filter((_, i) => (hourly.length - 1 - i) % 4 === 0);
+  return computeRSI(closes, 14);
+}
+
+const STABLE_SYMBOLS = new Set([
+  "USDT", "USDC", "DAI", "FDUSD", "TUSD", "USDE", "USDS", "PYUSD", "USD1", "BUSD", "FRAX", "USDD", "GUSD", "USDP",
+  "LUSD", "CRVUSD", "RLUSD", "USD0", "USDTB", "SUSDE", "SUSDS", "EURC", "EURS", "EURT", "BFUSD", "USDF", "USDG", "USDX", "USDB", "USDY", "BUIDL",
+]);
+function isStablecoin(c) {
+  if (STABLE_SYMBOLS.has(c.symbol)) return true;
+  const small = (v, lim) => isNum(v) && Math.abs(v) < lim;
+  return small(c.change7d, 0.6) && small(c.change30d, 1.5) && small(c.change200d, 3);
+}
+
+// Ramène x linéairement sur 0–100 entre a (0 point) et b (100 points).
+const toPoints = (x, a, b) => Math.max(0, Math.min(100, ((x - a) / (b - a)) * 100));
+
+const SCORE_PARTS = [
+  {
+    key: "ath",
+    label: "Décote sous le plus haut historique",
+    weight: 0.3,
+    get: (c) => c.athChange,
+    points: (v) => toPoints(-v, 0, 80),
+    rule: "0 point au plus haut historique, 100 points à −80 % ou plus bas.",
+  },
+  {
+    key: "pullback",
+    label: "Repli sur 30 jours",
+    weight: 0.25,
+    get: (c) => c.change30d,
+    points: (v) => toPoints(20 - v, 0, 50),
+    rule: "0 point après +20 % ou plus, 100 points après −30 % ou plus.",
+  },
+  {
+    key: "trend",
+    label: "Tendance de fond sur 200 jours",
+    weight: 0.2,
+    get: (c) => c.change200d,
+    points: (v) => toPoints(v, -50, 50),
+    rule: "0 point à −50 % ou moins, 100 points à +50 % ou plus : pénalise les baisses durables.",
+  },
+  {
+    key: "rsi",
+    label: "Survente court terme (RSI 14, bougies 4 h)",
+    weight: 0.25,
+    get: (c) => c.rsi,
+    points: (v) => toPoints(70 - v, 0, 40),
+    rule: "0 point à RSI 70 ou plus (suracheté), 100 points à RSI 30 ou moins (survendu).",
+  },
+];
+const SCORE_BANDS = [
+  { min: 80, id: 4, label: "Très élevé" },
+  { min: 60, id: 3, label: "Élevé" },
+  { min: 40, id: 2, label: "Moyen" },
+  { min: 0, id: 1, label: "Faible" },
+];
+
+/**
+ * Score 0–100 : moyenne pondérée de mesures ramenées sur 100
+ * (poids renormalisés si une mesure manque ; au moins 3 mesures requises).
+ */
+function computeScore(c) {
+  if (c.stable) return { total: null, reason: "Stablecoin : cours indexé sur une monnaie, non noté.", parts: [] };
+  const parts = SCORE_PARTS.map((p) => {
+    const raw = p.get(c);
+    return { key: p.key, label: p.label, weight: p.weight, rule: p.rule, raw: isNum(raw) ? raw : null, points: isNum(raw) ? p.points(raw) : null };
+  });
+  const avail = parts.filter((p) => p.points != null);
+  if (avail.length < 3) return { total: null, reason: "Historique insuffisant pour calculer le score.", parts };
+  const weight = sum(avail, (p) => p.weight);
+  const total = Math.round(sum(avail, (p) => p.points * p.weight) / weight);
+  return { total, band: SCORE_BANDS.find((b) => total >= b.min), parts, weight };
+}
+function withScore(coin) {
+  const c = { ...coin, stable: isStablecoin(coin) };
+  c.score = computeScore(c);
+  return c;
+}
+
+function rollingMean(values, k) {
+  const out = new Array(values.length).fill(null);
+  let acc = 0;
+  for (let i = 0; i < values.length; i++) {
+    acc += values[i];
+    if (i >= k) acc -= values[i - k];
+    if (i >= k - 1) out[i] = acc / k;
+  }
+  return out;
+}
+
+/**
+ * Seuils clés sur un an de clôtures journalières :
+ * moyennes mobiles 50/200 j, plus hauts/bas 30 j, 90 j, 52 semaines, plus haut historique,
+ * et zones de support/résistance = pivots (extrêmes locaux sur ±5 jours) regroupés à 2,5 % près,
+ * retenus s'ils ont été touchés au moins deux fois.
+ */
+function computeKeyLevels(points, current, ath) {
+  const closes = points.map((p) => p[1]);
+  const n = closes.length;
+  const ref = isNum(current) ? current : closes[n - 1];
+  const tail = (k) => closes.slice(Math.max(0, n - k));
+  const raw = [];
+  const push = (label, value, kind, extra) => {
+    if (isNum(value) && value > 0) raw.push({ label, value, kind, ...extra });
+  };
+  const ma50 = rollingMean(closes, 50);
+  const ma200 = rollingMean(closes, 200);
+  push("Moyenne mobile 50 jours", ma50[n - 1], "moyenne");
+  push("Moyenne mobile 200 jours", ma200[n - 1], "moyenne");
+  push("Plus haut 30 jours", Math.max(...tail(30)), "extreme");
+  push("Plus bas 30 jours", Math.min(...tail(30)), "extreme");
+  if (n >= 90) {
+    push("Plus haut 90 jours", Math.max(...tail(90)), "extreme");
+    push("Plus bas 90 jours", Math.min(...tail(90)), "extreme");
+  }
+  if (n >= 300) {
+    push("Plus haut 52 semaines", Math.max(...closes), "extreme");
+    push("Plus bas 52 semaines", Math.min(...closes), "extreme");
+  }
+  push("Plus haut historique", ath, "extreme");
+
+  const W = 5;
+  const pivots = [];
+  for (let i = W; i < n - W; i++) {
+    let high = true;
+    let low = true;
+    for (let j = i - W; j <= i + W; j++) {
+      if (j === i) continue;
+      if (closes[j] >= closes[i]) high = false;
+      if (closes[j] <= closes[i]) low = false;
+    }
+    if (high || low) pivots.push(closes[i]);
+  }
+  pivots.sort((a, b) => a - b);
+  const zones = [];
+  for (const v of pivots) {
+    const z = zones[zones.length - 1];
+    if (z && v <= z.mean * 1.025) {
+      z.total += v;
+      z.count += 1;
+      z.mean = z.total / z.count;
+    } else zones.push({ total: v, count: 1, mean: v });
+  }
+  const tested = zones.filter((z) => z.count >= 2);
+  const supports = tested.filter((z) => z.mean < ref).sort((a, b) => b.mean - a.mean).slice(0, 2);
+  const resistances = tested.filter((z) => z.mean > ref).sort((a, b) => a.mean - b.mean).slice(0, 2);
+  supports.forEach((z, i) => push(`Support ${i + 1}`, z.mean, "support", { touches: z.count }));
+  resistances.forEach((z, i) => push(`Résistance ${i + 1}`, z.mean, "resistance", { touches: z.count }));
+
+  raw.sort((a, b) => b.value - a.value);
+  const levels = [];
+  for (const l of raw) {
+    const same = levels.find((x) => x.kind === l.kind && Math.abs(x.value - l.value) / l.value < 0.0015);
+    if (same) same.label += ` · ${l.label.replace(/^Plus (haut|bas) /, "")}`;
+    else levels.push({ ...l, key: `${l.kind}:${l.label}` });
+  }
+  return {
+    levels,
+    supports: supports.map((z) => z.mean),
+    resistances: resistances.map((z) => z.mean),
+    series: points.map((p, i) => ({ t: p[0], v: p[1], ma200: ma200[i] })),
+  };
+}
 
 /* ─────────────────────────── Cours simulés (repli) ─────────────────────────── */
 
@@ -438,7 +648,10 @@ function demoMarket(state, cur) {
     .map((c) => {
       const s = c.series;
       const last = s[s.length - 1];
-      return {
+      const r = mulberry32(hashStr(`${c.id}:meta`));
+      const calm = c.vol < 0.001;
+      const athChange = calm ? -0.4 * r() : -(4 + r() * 78);
+      return withScore({
         id: c.id,
         symbol: c.symbol,
         name: c.name,
@@ -446,10 +659,16 @@ function demoMarket(state, cur) {
         price: last * fx,
         change24h: (last / s[s.length - 25] - 1) * 100,
         change7d: (last / s[0] - 1) * 100,
+        change30d: calm ? (r() - 0.5) * 0.4 : (r() - 0.55) * 44,
+        change200d: calm ? (r() - 0.5) * 0.8 : (r() - 0.42) * 130,
+        ath: (last * fx) / (1 + athChange / 100),
+        athChange,
+        athDate: null,
         mcap: last * c.supply * fx,
         rank: 0,
+        rsi: rsiFromHourly(s),
         spark: downsample(s, 42).map((v) => ({ v: v * fx })),
-      };
+      });
     })
     .sort((a, b) => b.mcap - a.mcap)
     .map((c, i) => ({ ...c, rank: i + 1 }));
@@ -1001,6 +1220,7 @@ function parseBackup(text) {
       triggeredCurrency: typeof a.triggeredCurrency === "string" ? a.triggeredCurrency : null,
       simulated: !!a.simulated,
       seen: true,
+      note: typeof a.note === "string" ? a.note.slice(0, 80) : "",
     }));
   const s = obj.settings || {};
   const settings = {};
@@ -1115,6 +1335,7 @@ const CSS = `
   --focus:#2F6BE0;--av-l:88%;
   --shadow:0 1px 2px rgba(18,26,36,.06),0 8px 24px rgba(18,26,36,.08);
   --s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--s6:#008300;--s7:#4a3aa7;--s8:#e34948;--s-other:#98A2AF;
+  --sc1:#E6EEFA;--sc1-ink:#27528F;--sc2:#BDD5F5;--sc2-ink:#123E78;--sc3:#2F6FCB;--sc3-ink:#FFFFFF;--sc4:#123A78;--sc4-ink:#FFFFFF;
   --font:'Public Sans',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
   --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   color-scheme:light;font-family:var(--font);font-size:14px;line-height:1.45;color:var(--ink);background:var(--bg);
@@ -1130,6 +1351,7 @@ const CSS = `
   --focus:#7FA6F5;--av-l:28%;
   --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 28px rgba(0,0,0,.4);
   --s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767;--s-other:#6B7686;
+  --sc1:#1B2A40;--sc1-ink:#A9C4F0;--sc2:#25446F;--sc2-ink:#D5E3FA;--sc3:#3A74CC;--sc3-ink:#FFFFFF;--sc4:#9CC0F7;--sc4-ink:#0B1A30;
   color-scheme:dark;
 }
 .rc *,.rc *::before,.rc *::after{box-sizing:border-box}
@@ -1286,26 +1508,33 @@ const CSS = `
 .rc-mkt-row:last-child{border-bottom:0}
 .rc-mkt-row:not(.rc-mkt-head):hover{background:var(--surface-2)}
 .rc-mkt-head{display:none;min-height:0;padding-top:8px;padding-bottom:8px;background:var(--surface-2);font-size:11.5px;color:var(--muted);font-weight:600}
-.rc-mkt .c-rank,.rc-mkt .c-24h,.rc-mkt .c-7d,.rc-mkt .c-mcap,.rc-mkt .c-spark{display:none}
+.rc-mkt .c-rank,.rc-mkt .c-24h,.rc-mkt .c-7d,.rc-mkt .c-mcap,.rc-mkt .c-spark,.rc-mkt .c-score{display:none}
 .rc-mkt .c-price,.rc-mkt .c-24h,.rc-mkt .c-7d,.rc-mkt .c-mcap{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.rc-mkt .c-score{text-align:center}
 .rc-mkt .c-price{font-weight:600}
 .rc-sort{border:0;background:none;padding:0;font:inherit;color:inherit;display:inline-flex;align-items:center;gap:2px;white-space:nowrap}
 .rc-sort[aria-pressed="true"]{color:var(--ink)}
 .rc-star{width:28px;height:28px;display:grid;place-items:center;border:0;background:none;border-radius:7px;color:var(--rule-2)}
 .rc-star:hover{background:var(--surface-3);color:var(--muted)}
 .rc-star.on{color:#E0A100}
+.rc-asset-btn{display:block;width:100%;min-width:0;border:0;background:none;padding:2px 0;text-align:left;border-radius:6px;color:inherit}
+.rc-asset-btn:hover .rc-asset-name{color:var(--accent);text-decoration:underline;text-underline-offset:2px}
 .rc-only-sm{display:block}
 .rc-inline-sm{display:inline}
 .rc-only-sm .rc-delta{font-size:12px;font-weight:600}
 .rc-sort-select{display:block}
 @media (min-width:640px){
-  .rc-mkt-row{grid-template-columns:30px 34px minmax(140px,1.5fr) minmax(92px,1fr) 78px 78px 104px 32px}
+  .rc-mkt-row{grid-template-columns:30px 30px minmax(120px,1.5fr) minmax(88px,1fr) 76px 76px 60px 32px}
   .rc-mkt-head{display:grid}
-  .rc-mkt .c-rank,.rc-mkt .c-24h,.rc-mkt .c-7d,.rc-mkt .c-spark{display:block}
+  .rc-mkt .c-rank,.rc-mkt .c-24h,.rc-mkt .c-7d,.rc-mkt .c-score{display:block}
   .rc-only-sm,.rc-inline-sm,.rc-sort-select{display:none}
 }
-@media (min-width:1180px){
-  .rc-mkt-row{grid-template-columns:30px 34px minmax(170px,1.6fr) minmax(100px,1fr) 92px 92px minmax(96px,.9fr) 104px 32px}
+@media (min-width:1100px){
+  .rc-mkt-row{grid-template-columns:30px 34px minmax(150px,1.6fr) minmax(96px,1fr) 84px 84px 104px 60px 32px}
+  .rc-mkt .c-spark{display:block}
+}
+@media (min-width:1400px){
+  .rc-mkt-row{grid-template-columns:30px 34px minmax(170px,1.6fr) minmax(100px,1fr) 92px 92px minmax(96px,.9fr) 104px 60px 32px}
   .rc-mkt .c-mcap{display:block}
 }
 .rc-spark-empty{color:var(--muted)}
@@ -1383,6 +1612,9 @@ textarea.rc-input{height:auto;min-height:150px;padding:10px 11px;font-family:var
 .rc-legend-inline{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--ink-2);align-items:center}
 .rc-key{display:inline-block;width:14px;height:0;border-top:2px solid var(--s1);vertical-align:middle;margin-right:6px}
 .rc-key.dash{border-top:2px dashed var(--ink-2)}
+.rc-key.dot{border-top:2px dotted var(--ink-2)}
+.rc-key.sup{border-top:2px dashed var(--s3)}
+.rc-key.res{border-top:2px dashed var(--s2)}
 .rc-tip{background:var(--surface);border:1px solid var(--rule-2);border-radius:10px;padding:9px 11px;box-shadow:var(--shadow);font-size:12.5px;min-width:190px;color:var(--ink)}
 .rc-tip-date{font-weight:650;margin-bottom:5px}
 .rc-tip-row{display:flex;align-items:center;gap:6px;justify-content:space-between}
@@ -1415,6 +1647,42 @@ textarea.rc-input{height:auto;min-height:150px;padding:10px 11px;font-family:var
 @media (max-width:479px){.rc-hide-xs{display:none}}
 .rc-code{font-family:var(--mono);font-size:12px;background:var(--surface-2);border:1px solid var(--rule);border-radius:8px;padding:8px 10px;overflow-x:auto;white-space:pre}
 
+.rc-score{display:inline-grid;place-items:center;min-width:36px;height:24px;padding:0 7px;border-radius:6px;border:0;font-weight:700;font-size:12.5px;font-variant-numeric:tabular-nums;line-height:1}
+button.rc-score{cursor:pointer}
+button.rc-score:hover{filter:brightness(.94)}
+.rc-score.b1{background:var(--sc1);color:var(--sc1-ink)}
+.rc-score.b2{background:var(--sc2);color:var(--sc2-ink)}
+.rc-score.b3{background:var(--sc3);color:var(--sc3-ink)}
+.rc-score.b4{background:var(--sc4);color:var(--sc4-ink)}
+.rc-score.na{background:transparent;color:var(--muted);font-weight:500}
+.rc-score.sm{height:18px;min-width:26px;padding:0 5px;font-size:11px;border-radius:5px;vertical-align:1px}
+.rc-score.big{height:52px;min-width:64px;font-size:26px;border-radius:10px}
+.rc-sheet{display:flex;flex-direction:column;gap:18px}
+.rc-sheet-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.rc-sheet-head .rc-sheet-price{margin-left:auto;text-align:right}
+.rc-sheet-price strong{display:block;font-size:18px;font-variant-numeric:tabular-nums}
+.rc-sheet h3{font-size:14.5px;font-weight:650;margin-bottom:4px}
+.rc-sheet-total{display:flex;align-items:center;gap:12px;margin:8px 0 12px}
+.rc-parts{display:flex;flex-direction:column;gap:12px}
+.rc-part-head,.rc-part-foot{display:flex;justify-content:space-between;gap:2px 10px;align-items:baseline;flex-wrap:wrap}
+.rc-part-head{font-size:13px;font-weight:600;margin-bottom:5px}
+.rc-part-foot{margin-top:4px;font-size:11.5px;color:var(--muted)}
+.rc-meter{height:6px;border-radius:3px;background:var(--surface-3);overflow:hidden}
+.rc-meter>span{display:block;height:100%;border-radius:3px;background:var(--s1)}
+.rc-ladder{display:flex;flex-direction:column;border:1px solid var(--rule);border-radius:10px;overflow:hidden}
+.rc-ladder li{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--rule);font-size:13px}
+.rc-ladder li:last-child{border-bottom:0}
+.rc-ladder li.now{background:var(--accent-soft);font-weight:650}
+.rc-ladder .rc-lvl-name{display:flex;align-items:center;gap:8px;min-width:0}
+.rc-ladder .rc-lvl-name span:last-child{min-width:0}
+.rc-ladder .rc-lvl-val{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.rc-ladder .rc-lvl-val small{display:block;color:var(--muted);font-size:11.5px;font-weight:500}
+.rc-lvl-dot{width:10px;height:10px;border-radius:50%;flex:none}
+.rc-lvl-dot.support{background:var(--s3)}.rc-lvl-dot.resistance{background:var(--s2)}.rc-lvl-dot.moyenne{background:var(--ink-2)}.rc-lvl-dot.extreme{background:transparent;border:2px solid var(--muted)}
+.rc-sentiment{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 14px;border:1px solid var(--rule);border-radius:12px;background:var(--surface);font-size:13px}
+.rc-sentiment strong{font-size:18px;font-variant-numeric:tabular-nums}
+.rc-gauge{position:relative;flex:1 1 140px;max-width:260px;height:6px;border-radius:3px;background:linear-gradient(90deg,var(--s2),var(--surface-3) 50%,var(--s1))}
+.rc-gauge i{position:absolute;top:-4px;width:4px;height:14px;border-radius:2px;background:var(--ink);transform:translateX(-50%)}
 @media (prefers-reduced-motion:reduce){.rc *,.rc *::before{animation:none!important;transition:none!important}}
 `;
 
@@ -1667,6 +1935,24 @@ function Toasts({ toasts, onDismiss }) {
         </div>
       ))}
     </div>
+  );
+}
+
+function ScoreChip({ score, onClick, small = false }) {
+  if (!score || score.total == null) {
+    return (
+      <span className={`rc-score na${small ? " sm" : ""}`} title={score ? score.reason : "Score indisponible"}>
+        —
+      </span>
+    );
+  }
+  const cls = `rc-score b${score.band.id}${small ? " sm" : ""}`;
+  const label = `Score d'opportunité ${score.total} sur 100 (${score.band.label.toLowerCase()})`;
+  if (!onClick) return <span className={cls} title={label}>{score.total}</span>;
+  return (
+    <button type="button" className={cls} onClick={onClick} aria-label={`${label} : voir le détail`} title={label}>
+      {score.total}
+    </button>
   );
 }
 
@@ -2438,6 +2724,7 @@ function ValueChart({ data, currency, days }) {
             type="number"
             scale="time"
             domain={["dataMin", "dataMax"]}
+            ticks={days > 90 && data.length ? monthTicks(data[0].t, data[data.length - 1].t) : undefined}
             tickFormatter={tick}
             tick={{ fill: "var(--muted)", fontSize: 11 }}
             tickLine={false}
@@ -2546,7 +2833,7 @@ function AllocationChart({ slices, total, currency }) {
 
 /* ─────────────────────────── Vue Portefeuille ─────────────────────────── */
 
-function PositionsTable({ rows, currency, colorOf, totalValue }) {
+function PositionsTable({ rows, currency, colorOf, totalValue, onOpenCoin }) {
   const [showClosed, setShowClosed] = useState(false);
   const open = rows.filter((r) => r.qty > 0).sort((a, b) => (b.value || 0) - (a.value || 0) || a.name.localeCompare(b.name));
   const closed = rows.filter((r) => r.qty <= 0);
@@ -2605,7 +2892,9 @@ function PositionsTable({ rows, currency, colorOf, totalValue }) {
                       {colorOf(r.coinId) && <span className="rc-swatch" style={{ background: colorOf(r.coinId) }} aria-hidden="true" />}
                       <CoinAvatar coin={{ id: r.coinId, symbol: r.symbol, image: r.image }} />
                       <div className="rc-asset-text">
-                        <div className="rc-asset-name">{r.name}</div>
+                        <button type="button" className="rc-asset-btn" onClick={() => onOpenCoin(r)} aria-label={`Fiche ${r.name} : score et seuils clés`}>
+                          <div className="rc-asset-name">{r.name}</div>
+                        </button>
                         <div className="rc-asset-sym">
                           {r.symbol}
                           {r.qty <= 0 ? " · soldée" : ""}
@@ -2823,6 +3112,7 @@ function PortfolioView({
   onImport,
   onExport,
   onSample,
+  onOpenCoin,
   fxNote,
 }) {
   const positions = useMemo(() => computePositions(transactions, conv), [transactions, conv]);
@@ -3035,9 +3325,291 @@ function PortfolioView({
         </section>
       </div>
 
-      <PositionsTable rows={rows} currency={currency} colorOf={colorOf} totalValue={totals.value} />
+      <PositionsTable rows={rows} currency={currency} colorOf={colorOf} totalValue={totals.value} onOpenCoin={(r) => onOpenCoin(r.coinId)} />
       <TransactionsTable transactions={transactions} onEdit={onEdit} onDelete={onDelete} />
     </>
+  );
+}
+
+/* ─────────────────────────── Fiche actif : score et seuils clés ─────────────────────────── */
+
+function LevelsTooltip({ active, payload, label, currency }) {
+  if (!active || !payload || !payload.length) return null;
+  const p = payload[0].payload;
+  return (
+    <div className="rc-tip">
+      <div className="rc-tip-date">{fmtDay(label)}</div>
+      <div className="rc-tip-row">
+        <span>
+          <i className="rc-key" />
+          Cours
+        </span>
+        <b>{fmtPrice(p.v, currency)}</b>
+      </div>
+      {isNum(p.ma200) && (
+        <div className="rc-tip-row">
+          <span>
+            <i className="rc-key dot" />
+            MM 200 jours
+          </span>
+          <b>{fmtPrice(p.ma200, currency)}</b>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LevelsChart({ data, currency }) {
+  return (
+    <div className="rc-chart" role="img" aria-label="Cours sur un an avec moyenne mobile 200 jours, supports et résistances">
+      <ResponsiveContainer width="100%" height={210}>
+        <ComposedChart data={data.series} margin={{ top: 8, right: 22, bottom: 0, left: 0 }}>
+          <CartesianGrid vertical={false} stroke="var(--rule)" />
+          <XAxis
+            dataKey="t"
+            type="number"
+            scale="time"
+            domain={["dataMin", "dataMax"]}
+            ticks={data.series.length ? monthTicks(data.series[0].t, data.series[data.series.length - 1].t) : undefined}
+            tickFormatter={(t) => dtf({ month: "short" }).format(t)}
+            tick={{ fill: "var(--muted)", fontSize: 11 }}
+            tickLine={false}
+            axisLine={{ stroke: "var(--rule-2)" }}
+            minTickGap={16}
+          />
+          <YAxis
+            domain={["auto", "auto"]}
+            tickFormatter={(v) => fmtCompact(v, currency, 1)}
+            tick={{ fill: "var(--muted)", fontSize: 11 }}
+            tickLine={false}
+            axisLine={false}
+            width={64}
+          />
+          <Tooltip content={<LevelsTooltip currency={currency} />} cursor={{ stroke: "var(--rule-2)", strokeWidth: 1 }} />
+          {data.supports.map((v) => (
+            <ReferenceLine key={`s${v}`} y={v} stroke="var(--s3)" strokeWidth={1.5} strokeDasharray="5 4" />
+          ))}
+          {data.resistances.map((v) => (
+            <ReferenceLine key={`r${v}`} y={v} stroke="var(--s2)" strokeWidth={1.5} strokeDasharray="5 4" />
+          ))}
+          <Line type="monotone" dataKey="ma200" stroke="var(--ink-2)" strokeWidth={1.5} strokeDasharray="2 3" dot={false} isAnimationActive={false} />
+          <Line
+            type="monotone"
+            dataKey="v"
+            stroke="var(--s1)"
+            strokeWidth={2}
+            dot={false}
+            activeDot={{ r: 4, stroke: "var(--surface)", strokeWidth: 2, fill: "var(--s1)" }}
+            isAnimationActive={false}
+          />
+        </ComposedChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function CoinSheet({ coin, currency, demo, starred, alerts, loadLevels, onToggleStar, onQuickAlert, onCustomAlert, onAddTx }) {
+  const [state, setState] = useState({ status: "loading" });
+  const [reload, setReload] = useState(0);
+  useEffect(() => {
+    let off = false;
+    setState({ status: "loading" });
+    Promise.resolve()
+      .then(() => loadLevels(coin.id))
+      .then((points) => {
+        if (off) return;
+        if (!points || points.length < 30) setState({ status: "error", message: "moins de 30 jours de cotation disponibles" });
+        else setState({ status: "ready", points });
+      })
+      .catch((err) => {
+        if (!off) setState({ status: "error", message: describeError(err) });
+      });
+    return () => {
+      off = true;
+    };
+  }, [coin.id, reload, loadLevels]);
+
+  const levels = useMemo(() => (state.status === "ready" ? computeKeyLevels(state.points, coin.price, coin.ath) : null), [state, coin.price, coin.ath]);
+  const score = coin.score;
+  const hasPrice = isNum(coin.price) && coin.price > 0;
+  const hasAlert = (value) =>
+    alerts.some((a) => a.coinId === coin.id && !a.triggeredAt && a.currency === currency && Math.abs(a.threshold - value) / value < 0.002);
+  const partText = (p) => {
+    if (p.raw == null) return "indisponible";
+    if (p.key === "rsi") return `RSI ${Math.round(p.raw)}`;
+    if (p.key === "ath" && isNum(coin.ath)) {
+      return `${fmtPct(p.raw)} (plus haut ${fmtPrice(coin.ath, currency)}${coin.athDate ? ` le ${fmtDate(coin.athDate.slice(0, 10))}` : ""})`;
+    }
+    return fmtPct(p.raw);
+  };
+  const rows = [];
+  if (levels) {
+    let placed = false;
+    for (const l of levels.levels) {
+      if (!placed && hasPrice && l.value < coin.price) {
+        rows.push({ now: true });
+        placed = true;
+      }
+      rows.push(l);
+    }
+    if (!placed && hasPrice) rows.push({ now: true });
+  }
+
+  return (
+    <div className="rc-sheet">
+      <div className="rc-sheet-head">
+        <CoinAvatar coin={coin} size={36} />
+        <div>
+          <div className="rc-asset-sym">
+            {coin.symbol}
+            {coin.rank ? ` · rang ${coin.rank}` : ""}
+            {demo ? " · cours simulés" : ""}
+          </div>
+        </div>
+        <div className="rc-sheet-price">
+          <strong>{fmtPrice(coin.price, currency)}</strong>
+          <Delta value={coin.change24h} /> <span className="rc-muted">24 h</span>
+        </div>
+      </div>
+
+      <section aria-labelledby="rc-sheet-score">
+        <h3 id="rc-sheet-score">Score d'opportunité</h3>
+        {score && score.total != null ? (
+          <>
+            <div className="rc-sheet-total">
+              <span className={`rc-score big b${score.band.id}`}>{score.total}</span>
+              <div>
+                <strong>{score.band.label}</strong>
+                <p className="rc-help">sur 100 · moyenne pondérée de {score.parts.filter((p) => p.points != null).length} mesures</p>
+              </div>
+            </div>
+            <ul className="rc-parts">
+              {score.parts.map((p) => (
+                <li key={p.key}>
+                  <div className="rc-part-head">
+                    <span>{p.label}</span>
+                    <span className="rc-num">{partText(p)}</span>
+                  </div>
+                  <div className="rc-meter" role="img" aria-label={`${p.points == null ? 0 : Math.round(p.points)} points sur 100`}>
+                    <span style={{ width: `${p.points || 0}%` }} />
+                  </div>
+                  <div className="rc-part-foot">
+                    <span>{p.rule}</span>
+                    <span className="rc-num" style={{ whiteSpace: "nowrap" }}>
+                      {p.points == null ? "—" : `${Math.round(p.points)} pts`} · poids {p.points == null ? 0 : Math.round((p.weight / score.weight) * 100)} %
+                    </span>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </>
+        ) : (
+          <p className="rc-help">{score ? score.reason : "Score indisponible : cours non chargé."}</p>
+        )}
+        <p className="rc-footnote" style={{ marginTop: 10 }}>
+          Indicateur descriptif calculé sur les cours passés : il ne prédit pas l'évolution future et ne constitue pas un conseil d'investissement.
+        </p>
+      </section>
+
+      <section aria-labelledby="rc-sheet-levels">
+        <h3 id="rc-sheet-levels">Seuils clés</h3>
+        <p className="rc-help">
+          Calculés sur un an de clôtures journalières. Supports et résistances : zones où le cours s'est retourné au moins deux fois, à 2,5 % près.
+        </p>
+        {state.status === "loading" ? (
+          <div className="rc-chart-state" style={{ height: 210, marginTop: 10 }} aria-busy="true">
+            <span className="rc-skel" style={{ width: "70%", height: 10 }} />
+            <span>Chargement d'un an d'historique…</span>
+          </div>
+        ) : state.status === "error" ? (
+          <div className="rc-chart-state" style={{ height: 120, marginTop: 10 }}>
+            <span>Seuils indisponibles : {state.message}.</span>
+            <button type="button" className="rc-btn sm" onClick={() => setReload((n) => n + 1)}>
+              Réessayer
+            </button>
+          </div>
+        ) : (
+          <>
+            <div className="rc-legend-inline" style={{ margin: "10px 0 6px" }}>
+              <span>
+                <i className="rc-key" />
+                Cours
+              </span>
+              <span>
+                <i className="rc-key dot" />
+                Moyenne mobile 200 j
+              </span>
+              <span>
+                <i className="rc-key sup" />
+                Supports
+              </span>
+              <span>
+                <i className="rc-key res" />
+                Résistances
+              </span>
+            </div>
+            <LevelsChart data={levels} currency={currency} />
+            <ul className="rc-ladder" style={{ marginTop: 12 }} aria-label="Seuils du plus haut au plus bas">
+              {rows.map((r) =>
+                r.now ? (
+                  <li key="now" className="now">
+                    <span className="rc-lvl-name">
+                      <span className="rc-lvl-dot" style={{ background: "var(--accent)" }} aria-hidden="true" />
+                      <span>Cours actuel</span>
+                    </span>
+                    <span className="rc-lvl-val">{fmtPrice(coin.price, currency)}</span>
+                    <span style={{ width: 32 }} />
+                  </li>
+                ) : (
+                  <li key={r.key}>
+                    <span className="rc-lvl-name">
+                      <span className={`rc-lvl-dot ${r.kind}`} aria-hidden="true" />
+                      <span>
+                        {r.label}
+                        {r.touches ? <span className="rc-muted"> · {r.touches} contacts</span> : null}
+                      </span>
+                    </span>
+                    <span className="rc-lvl-val">
+                      {fmtPrice(r.value, currency)}
+                      {hasPrice && <small>{fmtPct((r.value / coin.price - 1) * 100)}</small>}
+                    </span>
+                    {!hasPrice ? (
+                      <span style={{ width: 32 }} />
+                    ) : hasAlert(r.value) ? (
+                      <span className="rc-icon-btn" title="Alerte déjà active à ce seuil" role="img" aria-label="Alerte déjà active">
+                        <Icon name="check" size={16} />
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="rc-icon-btn"
+                        onClick={() => onQuickAlert(coin, r)}
+                        aria-label={`Créer une alerte à ${fmtPrice(r.value, currency)} (${r.label})`}
+                        title="Créer une alerte à ce seuil"
+                      >
+                        <Icon name="bell" size={16} />
+                      </button>
+                    )}
+                  </li>
+                ),
+              )}
+            </ul>
+          </>
+        )}
+      </section>
+
+      <div className="rc-modal-foot">
+        <button type="button" className="rc-btn" onClick={() => onToggleStar(coin)} aria-pressed={starred}>
+          <Icon name="star" size={16} filled={starred} /> {starred ? "Retirer de la watchlist" : "Suivre"}
+        </button>
+        <button type="button" className="rc-btn" onClick={() => onAddTx(coin)}>
+          <Icon name="plus" size={16} /> Transaction
+        </button>
+        <button type="button" className="rc-btn primary" onClick={() => onCustomAlert(coin)}>
+          <Icon name="bell" size={16} /> Alerte personnalisée
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -3050,6 +3622,7 @@ const SORTS = {
   change24h: { label: "24 h", get: (c) => c.change24h, dir: -1 },
   change7d: { label: "7 j", get: (c) => c.change7d, dir: -1 },
   mcap: { label: "Capitalisation", get: (c) => c.mcap, dir: -1 },
+  score: { label: "Score", get: (c) => (c.score ? c.score.total : null), dir: -1 },
 };
 
 function sortCoins(list, sort) {
@@ -3065,7 +3638,7 @@ function sortCoins(list, sort) {
   });
 }
 
-const MarketRow = memo(function MarketRow({ coin, currency, starred, onToggleStar, onAlert }) {
+const MarketRow = memo(function MarketRow({ coin, currency, starred, onToggleStar, onAlert, onOpen }) {
   const up = isNum(coin.change7d) ? coin.change7d >= 0 : isNum(coin.change24h) ? coin.change24h >= 0 : true;
   return (
     <div className="rc-mkt-row" role="row">
@@ -3087,12 +3660,18 @@ const MarketRow = memo(function MarketRow({ coin, currency, starred, onToggleSta
         <div className="rc-asset">
           <CoinAvatar coin={coin} />
           <div className="rc-asset-text">
-            <div className="rc-asset-name" title={coin.name}>
-              {coin.name}
-            </div>
+            <button type="button" className="rc-asset-btn" onClick={() => onOpen(coin)} aria-label={`Fiche ${coin.name} : score et seuils clés`}>
+              <div className="rc-asset-name" title={coin.name}>
+                {coin.name}
+              </div>
+            </button>
             <div className="rc-asset-sym">
               {coin.symbol}
               {coin.rank ? <span className="rc-inline-sm">{` · #${coin.rank}`}</span> : null}
+              <span className="rc-inline-sm">
+                {" "}
+                <ScoreChip score={coin.score} small onClick={() => onOpen(coin)} />
+              </span>
             </div>
           </div>
         </div>
@@ -3115,6 +3694,9 @@ const MarketRow = memo(function MarketRow({ coin, currency, starred, onToggleSta
       <div role="cell" className="c-spark" aria-label={`Tendance 7 jours ${isNum(coin.change7d) ? fmtPct(coin.change7d) : "indisponible"}`}>
         <Sparkline data={coin.spark} positive={up} />
       </div>
+      <div role="cell" className="c-score">
+        <ScoreChip score={coin.score} onClick={() => onOpen(coin)} />
+      </div>
       <div role="cell">
         <button type="button" className="rc-icon-btn" onClick={() => onAlert(coin)} aria-label={`Créer une alerte de prix pour ${coin.name}`}>
           <Icon name="bell" size={16} />
@@ -3124,7 +3706,7 @@ const MarketRow = memo(function MarketRow({ coin, currency, starred, onToggleSta
   );
 });
 
-function MarketView({ market, watchlist, directory, onToggleStar, onAlert, remoteSearch }) {
+function MarketView({ market, watchlist, directory, onToggleStar, onAlert, onOpen, remoteSearch, sentiment }) {
   const [tab, setTab] = useState("top");
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState({ key: "rank", dir: 1 });
@@ -3172,6 +3754,17 @@ function MarketView({ market, watchlist, directory, onToggleStar, onAlert, remot
 
   return (
     <>
+      {sentiment && (
+        <div className="rc-sentiment" role="group" aria-label="Sentiment global du marché">
+          <span className="rc-muted">Sentiment global du marché</span>
+          <strong>{sentiment.value}</strong>
+          <span>{sentiment.label}</span>
+          <span className="rc-gauge" aria-hidden="true">
+            <i style={{ left: `${sentiment.value}%` }} />
+          </span>
+          <span className="rc-footnote">Indice Fear &amp; Greed (alternative.me), 0 = peur extrême, 100 = avidité extrême</span>
+        </div>
+      )}
       <div className="rc-toolbar">
         <Segmented
           label="Liste affichée"
@@ -3218,6 +3811,7 @@ function MarketView({ market, watchlist, directory, onToggleStar, onAlert, remot
             <option value="change7d:-1">Hausse 7 j</option>
             <option value="change7d:1">Baisse 7 j</option>
             <option value="mcap:-1">Capitalisation</option>
+            <option value="score:-1">Score d'opportunité</option>
           </select>
         </div>
       </div>
@@ -3236,6 +3830,7 @@ function MarketView({ market, watchlist, directory, onToggleStar, onAlert, remot
           <div role="columnheader" className="c-spark">
             7 derniers jours
           </div>
+          {header("score", "c-score")}
           <div role="columnheader">
             <span className="rc-sr">Alerte</span>
           </div>
@@ -3251,11 +3846,12 @@ function MarketView({ market, watchlist, directory, onToggleStar, onAlert, remot
                 <span className="rc-skel c-7d" style={{ height: 12, width: 50, justifySelf: "end" }} />
                 <span className="rc-skel c-mcap" style={{ height: 12, width: 60, justifySelf: "end" }} />
                 <span className="rc-skel c-spark" style={{ height: 20, width: 96 }} />
+                <span className="rc-skel c-score" style={{ height: 20, width: 36, justifySelf: "center" }} />
                 <span />
               </div>
             ))
           : list.map((c) => (
-              <MarketRow key={c.id} coin={c} currency={cur} starred={wlSet.has(c.id)} onToggleStar={onToggleStar} onAlert={onAlert} />
+              <MarketRow key={c.id} coin={c} currency={cur} starred={wlSet.has(c.id)} onToggleStar={onToggleStar} onAlert={onAlert} onOpen={onOpen} />
             ))}
         {!loading && !list.length && (
           <div className="rc-inline-empty" role="row">
@@ -3328,7 +3924,8 @@ function MarketView({ market, watchlist, directory, onToggleStar, onAlert, remot
           ? "Cours simulés (mode démonstration)."
           : market.updatedAt
             ? `Cours au ${fmtDay(market.updatedAt)} à ${fmtTime(market.updatedAt)} · source CoinGecko · devise ${cur}.`
-            : "Source CoinGecko."}
+            : "Source CoinGecko."}{" "}
+        Score d'opportunité : indicateur technique de 0 à 100 (décote, repli, tendance, RSI). Touchez un actif pour le détail et ses seuils clés.
       </p>
     </>
   );
@@ -3407,7 +4004,10 @@ function AlertsView({ alerts, priceMap, currency, conv, onNew, onEdit, onDelete,
                           <CoinAvatar coin={{ id: a.coinId, symbol: a.symbol, image: a.image || (c && c.image) }} />
                           <div className="rc-asset-text">
                             <div className="rc-asset-name">{a.name}</div>
-                            <div className="rc-asset-sym">{a.symbol}</div>
+                            <div className="rc-asset-sym">
+                              {a.symbol}
+                              {a.note ? ` · ${a.note}` : ""}
+                            </div>
                           </div>
                         </div>
                       </td>
@@ -3662,6 +4262,7 @@ export default function RegistreCrypto() {
   const [nextAt, setNextAt] = useState(null);
   const [toasts, setToasts] = useState([]);
   const [dialog, setDialog] = useState(null);
+  const [sentiment, setSentiment] = useState(null);
 
   const timerRef = useRef(null);
   const inflightRef = useRef(false);
@@ -3846,6 +4447,35 @@ export default function RegistreCrypto() {
     };
   }, [needsFx, fxMode, fxSlot]);
 
+  // Sentiment global (indice Fear & Greed) : facultatif, rafraîchi toutes les 30 min.
+  const marketReachable = market.status === "live" || market.status === "stale";
+  useEffect(() => {
+    if (!marketReachable) return undefined;
+    let off = false;
+    const load = async () => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+      try {
+        const res = await fetch(PATHS.sentiment, { signal: ctrl.signal });
+        if (!res.ok) return;
+        const d = await res.json();
+        const x = d && Array.isArray(d.data) ? d.data[0] : null;
+        const value = x ? Number(x.value) : NaN;
+        if (!off && isNum(value)) setSentiment({ value, label: FNG_LABELS[x.value_classification] || x.value_classification || "" });
+      } catch (e) {
+        /* indicateur facultatif : on n'affiche rien */
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    load();
+    const every = setInterval(load, 1_800_000);
+    return () => {
+      off = true;
+      clearInterval(every);
+    };
+  }, [marketReachable]);
+
   const conv = useMemo(() => {
     const values = rates && rates.values;
     return (amount, from) => {
@@ -3977,6 +4607,38 @@ export default function RegistreCrypto() {
     },
     [currency],
   );
+
+  const isDemo = market.status === "demo";
+  const loadLevels = useCallback((id) => loadHistory(id, 365, isDemo ? "demo" : "live"), [loadHistory, isDemo]);
+  const openCoin = useCallback((coinOrId) => setDialog({ type: "coin", id: typeof coinOrId === "string" ? coinOrId : coinOrId.id }), []);
+  const quickAlert = (coin, level) => {
+    const threshold = level.value >= 1 ? Math.round(level.value * 100) / 100 : Number(level.value.toPrecision(4));
+    const direction = threshold >= coin.price ? "above" : "below";
+    const alert = {
+      id: uid(),
+      coinId: coin.id,
+      symbol: coin.symbol,
+      name: coin.name,
+      image: coin.image || null,
+      direction,
+      threshold,
+      currency,
+      createdAt: Date.now(),
+      triggeredAt: null,
+      triggeredPrice: null,
+      triggeredCurrency: null,
+      simulated: false,
+      seen: true,
+      note: level.label,
+    };
+    setAlerts((prev) => [...prev, alert]);
+    pushToast({
+      kind: "success",
+      title: "Alerte créée",
+      body: `${coin.symbol} ${direction === "above" ? "≥" : "≤"} ${fmtPrice(threshold, currency)} (${level.label}).`,
+      action: { label: "Annuler", onClick: () => setAlerts((prev) => prev.filter((a) => a.id !== alert.id)) },
+    });
+  };
 
   /* Actions */
   const saveTransaction = (tx, editing) => {
@@ -4257,6 +4919,7 @@ export default function RegistreCrypto() {
                 onImport={() => setDialog({ type: "import", format: "csv" })}
                 onExport={exportCSV}
                 onSample={loadSample}
+                onOpenCoin={openCoin}
                 fxNote={
                   needsFx && !fxMissing ? (
                     <p className="rc-footnote">
@@ -4268,7 +4931,16 @@ export default function RegistreCrypto() {
               />
             )}
             {view === "marche" && (
-              <MarketView market={market} watchlist={watchlist} directory={directory} onToggleStar={toggleStar} onAlert={openAlert} remoteSearch={remoteSearch} />
+              <MarketView
+                market={market}
+                watchlist={watchlist}
+                directory={directory}
+                onToggleStar={toggleStar}
+                onAlert={openAlert}
+                onOpen={openCoin}
+                remoteSearch={remoteSearch}
+                sentiment={sentiment}
+              />
             )}
             {view === "alertes" && (
               <AlertsView
@@ -4344,6 +5016,28 @@ export default function RegistreCrypto() {
           />
         </Modal>
       )}
+      {dialog &&
+        dialog.type === "coin" &&
+        (() => {
+          const known = priceMap.get(dialog.id) || directory.get(dialog.id) || { id: dialog.id, symbol: dialog.id.toUpperCase(), name: dialog.id };
+          const coin = priceMap.has(dialog.id) ? known : { ...known, price: null };
+          return (
+            <Modal title={`Fiche ${coin.name}`} onClose={() => setDialog(null)} wide>
+              <CoinSheet
+                coin={coin}
+                currency={currency}
+                demo={isDemo}
+                starred={watchlist.includes(coin.id)}
+                alerts={alerts}
+                loadLevels={loadLevels}
+                onToggleStar={toggleStar}
+                onQuickAlert={quickAlert}
+                onCustomAlert={(c) => openAlert(c)}
+                onAddTx={(c) => setDialog({ type: "tx", preset: { coin: coinMeta(c) } })}
+              />
+            </Modal>
+          );
+        })()}
       {dialog && dialog.type === "export" && (
         <Modal title={dialog.title} onClose={() => setDialog(null)} wide>
           <ExportPanel
