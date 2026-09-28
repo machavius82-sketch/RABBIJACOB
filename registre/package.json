@@ -1,0 +1,13 @@
+{
+  "name": "registre-crypto",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Suivi personnel de portefeuille et de marché crypto (React + Recharts, données CoinGecko).",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
