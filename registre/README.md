@@ -12,7 +12,7 @@ Suivi personnel d'un portefeuille crypto et du marché, en un seul composant Rea
 
 ## Utilisation et cours réels
 
-- **Cours réels** : ouvrir `index.html` hors d'un artifact. Les cours se rafraîchissent toutes les 60 secondes. Trois façons de le faire :
+- **Cours réels** : ouvrir `index.html` hors d'un artifact, puis toucher « Synchroniser ». Trois façons d'ouvrir la page :
   - le site Vercel du dépôt : `https://rabbijacob.vercel.app/registre/` une fois la branche fusionnée dans `main`, ou l'aperçu Vercel de la branche avant la fusion ;
   - GitHub Pages, activé sur le dépôt : `…github.io/RABBIJACOB/registre/` après la fusion ;
   - un double-clic sur le fichier téléchargé.
@@ -47,7 +47,7 @@ Le sentiment global du marché (indice Fear & Greed, alternative.me) s'affiche a
 
 ## Seuils clés
 
-La fiche d'un actif calcule, sur un an de clôtures journalières (une requête, mise en cache 1 h) :
+La fiche d'un actif calcule, sur un an de clôtures journalières (une requête à l'ouverture de la fiche, réutilisée ensuite pendant 6 h) :
 
 - les moyennes mobiles à 50 et 200 jours ;
 - les plus hauts et plus bas sur 30 jours, 90 jours et 52 semaines, ainsi que le plus haut historique ;
@@ -66,6 +66,14 @@ date;type;actif_id;symbole;nom;quantite;prix_unitaire;frais;devise;note
 
 `actif_id` est l'identifiant CoinGecko (`bitcoin`, `ethereum`, `avalanche-2`…). À défaut, le symbole est rapproché du top 100. À l'import, les lignes identiques à une transaction existante sont ignorées, et chaque ligne rejetée est signalée avec son numéro et le motif.
 
-## API CoinGecko
+## API CoinGecko : synchronisation manuelle
 
-Les appels passent par une file d'attente unique, espacés d'au moins 1,2 s, avec un cache mémoire. Après un échec (HTTP 429, réseau, erreur 5xx), plus aucun appel n'est fait pendant une pause qui double à chaque échec : 15 s, 30 s, 60 s… jusqu'à 5 min. La pause dure au moins 60 s après un 429. Pendant ce temps, l'application affiche les dernières données reçues. Si CoinGecko n'a jamais répondu, elle affiche des cours simulés, signalés comme tels. L'historique de la courbe de valeur est mis en cache 15 min (7 et 30 jours) ou 1 h (90 jours et 1 an).
+Aucune requête ne part sans action de l'utilisateur : ni à l'ouverture de la page, ni à intervalle régulier, ni au changement de devise.
+
+- **« Synchroniser »** (barre du haut, Paramètres, bannières) déclenche 1 à 3 requêtes CoinGecko : le top 100, les actifs suivis hors du top 100 et les taux de change si un montant est libellé dans une autre devise. Elle charge aussi l'indice Fear & Greed. Les alertes sont vérifiées à chaque synchronisation.
+- **Historique** : la courbe de valeur ne se charge qu'après un clic sur « Charger l'évolution » ou sur une période. Elle se recharge ensuite si vous ajoutez une transaction sur un nouvel actif. La fiche d'un actif charge un an d'historique à son ouverture. Les historiques déjà reçus sont réutilisés sans nouvelle requête.
+- **Recherche** hors du top 100 : une requête par clic sur « Rechercher sur CoinGecko ».
+
+Les appels passent par une file d'attente unique, espacés d'au moins 1,2 s. Après un échec (HTTP 429, réseau, erreur 5xx), le bouton reste désactivé pendant une pause qui double à chaque échec : 15 s, 30 s, 60 s… jusqu'à 5 min. La pause dure au moins 60 s après un 429. Pendant ce temps, l'application affiche les cours de la dernière synchronisation réussie. Si CoinGecko n'a jamais répondu, elle affiche des cours simulés, signalés comme tels.
+
+Hébergée sur Vercel, la page ne coûte qu'une requête à son ouverture. Les synchronisations partent directement du navigateur vers CoinGecko, sans passer par Vercel.

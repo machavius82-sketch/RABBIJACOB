@@ -3,7 +3,7 @@
  *
  * Composant React autonome (hooks + Recharts), exécutable tel quel en artifact.
  * - Cours : API publique CoinGecko (sans clé), requêtes espacées en file d'attente,
- *   cache mémoire, repli exponentiel sur erreur ou HTTP 429, actualisation toutes les 60 s.
+ *   cache mémoire, repli exponentiel sur erreur ou HTTP 429. Synchronisation uniquement sur clic.
  * - Mode dégradé : dernières données reçues (cache) ; à défaut, cours simulés signalés.
  * - Données utilisateur : état React uniquement (aucun localStorage) ;
  *   sauvegarde / restauration JSON, import / export CSV des transactions.
@@ -30,7 +30,6 @@ import {
 /* ─────────────────────────── Constantes ─────────────────────────── */
 
 const API_BASE = "https://api.coingecko.com/api/v3";
-const REFRESH_MS = 60_000;
 const MIN_GAP_MS = 1_200;
 const TIMEOUT_MS = 15_000;
 const DAY_MS = 86_400_000;
@@ -338,6 +337,7 @@ function createClient() {
 
   return {
     request,
+    peek: (path) => cache.get(path) || null,
     blockedUntil: () => blockedUntil,
     blockedKind: () => (Date.now() < blockedUntil && lastError ? lastError.kind : null),
     resetBackoff: () => {
@@ -1405,7 +1405,6 @@ const CSS = `
 .rc-pill{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 9px;border-radius:999px;font-size:12px;font-weight:650;white-space:nowrap}
 .rc-pill::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
 .rc-pill.ok{color:var(--gain);background:var(--gain-soft)}
-.rc-pill.ok::before{animation:rc-pulse 2.4s ease-in-out infinite}
 .rc-pill.warn{color:var(--warn);background:var(--warn-soft)}
 .rc-pill.demo{color:var(--demo);background:var(--demo-soft)}
 .rc-pill.muted{color:var(--muted);background:var(--surface-3)}
@@ -1808,6 +1807,19 @@ function useNow(interval = 1000) {
   return now;
 }
 
+function SyncAge({ ts }) {
+  const now = useNow(15000);
+  if (!ts) return null;
+  const m = Math.floor(Math.max(0, now - ts) / 60000);
+  if (m < 1) return <span>à l'instant</span>;
+  if (m < 60) return <span>il y a {m} min</span>;
+  return (
+    <span>
+      il y a {Math.floor(m / 60)} h {pad2(m % 60)}
+    </span>
+  );
+}
+
 function Countdown({ target }) {
   const now = useNow();
   if (!target) return null;
@@ -1958,7 +1970,8 @@ function ScoreChip({ score, onClick, small = false }) {
 
 function StatusPill({ status }) {
   const map = {
-    live: ["En direct", "ok"],
+    idle: ["Non synchronisé", "muted"],
+    live: ["Synchronisé", "ok"],
     stale: ["Cache", "warn"],
     demo: ["Démo", "demo"],
     loading: ["Connexion…", "muted"],
@@ -2110,7 +2123,7 @@ function CoinPicker({ id, value, onChange, options, onRemoteSearch, invalid, des
           ))}
           {!items.length && remote.status !== "loading" && (
             <li className="rc-list-note" role="presentation">
-              {q ? "Aucun actif connu ne correspond." : "Aucun actif chargé pour l'instant."}
+              {q ? "Aucun actif connu ne correspond." : "Aucun actif chargé : synchronisez les cours ou lancez une recherche."}
             </li>
           )}
           {remote.status === "loading" && remote.query === q && (
@@ -3103,6 +3116,10 @@ function PortfolioView({
   conv,
   marketStatus,
   pricesReady,
+  syncing,
+  onSync,
+  historyEnabled,
+  onEnableHistory,
   loadHistory,
   period,
   setPeriod,
@@ -3128,27 +3145,40 @@ function PortfolioView({
 
   const startTs = isoToTs(todayISO()) - period * DAY_MS;
   const idsKey = useMemo(() => coinsActiveInPeriod(transactions, startTs).join(","), [transactions, startTs]);
-  const histMode = marketStatus === "loading" ? null : marketStatus === "demo" ? "demo" : "live";
+  const histMode = marketStatus === "demo" ? "demo" : "live";
   const [hist, setHist] = useState({ status: "idle", histories: new Map(), failed: [], loaded: 0, total: 0 });
   const [reload, setReload] = useState(0);
 
+  // Historique : lu dans le cache ; requêtes CoinGecko seulement après accord (bouton ou choix d'une période).
   useEffect(() => {
     if (!idsKey) {
       setHist({ status: "idle", histories: new Map(), failed: [], loaded: 0, total: 0 });
       return undefined;
     }
-    if (!histMode) {
-      setHist({ status: "loading", histories: new Map(), failed: [], loaded: 0, total: idsKey.split(",").length });
-      return undefined;
-    }
     let cancelled = false;
     const ids = idsKey.split(",");
-    setHist({ status: "loading", histories: new Map(), failed: [], loaded: 0, total: ids.length });
+    const allowNetwork = histMode === "demo" || historyEnabled;
     (async () => {
       const histories = new Map();
+      const missing = [];
+      for (const id of ids) {
+        const pts = await loadHistory(id, period, histMode, { cacheOnly: true });
+        if (pts && pts.length) histories.set(id, pts);
+        else missing.push(id);
+      }
+      if (cancelled) return;
+      if (!missing.length) {
+        setHist({ status: "ready", histories, failed: [], loaded: ids.length, total: ids.length });
+        return;
+      }
+      if (!allowNetwork) {
+        setHist({ status: "needs", histories, failed: [], missing: missing.length, loaded: histories.size, total: ids.length });
+        return;
+      }
+      setHist({ status: "loading", histories, failed: [], loaded: histories.size, total: ids.length });
       const failed = [];
       let lastError = null;
-      for (const id of ids) {
+      for (const id of missing) {
         if (cancelled) return;
         try {
           const pts = await loadHistory(id, period, histMode);
@@ -3167,7 +3197,7 @@ function PortfolioView({
     return () => {
       cancelled = true;
     };
-  }, [idsKey, period, histMode, reload, loadHistory]);
+  }, [idsKey, period, histMode, historyEnabled, reload, loadHistory]);
 
   const series = useMemo(
     () => (hist.status === "ready" ? buildValueSeries({ transactions, histories: hist.histories, days: period, conv, priceMap }) : []),
@@ -3198,9 +3228,11 @@ function PortfolioView({
     );
   }
 
-  const loadingPrices = !pricesReady;
-  const heroSub =
-    totals.change24 != null ? (
+  const loadingPrices = !pricesReady && syncing;
+  const noPrices = !pricesReady && !syncing;
+  const heroSub = noPrices ? (
+    <span className="rc-muted">Cours non synchronisés</span>
+  ) : totals.change24 != null ? (
       <>
         <span>24 h</span>
         <MoneyDelta value={totals.change24} currency={currency} />
@@ -3270,10 +3302,27 @@ function PortfolioView({
                 </span>
               </div>
             </div>
-            <Segmented label="Période" value={period} onChange={setPeriod} options={PERIODS.map((p) => ({ value: p.days, label: p.label }))} />
+            <Segmented
+              label="Période"
+              value={period}
+              onChange={(d) => {
+                setPeriod(d);
+                onEnableHistory();
+              }}
+              options={PERIODS.map((p) => ({ value: p.days, label: p.label }))}
+            />
           </div>
           {hist.status === "idle" ? (
             <div className="rc-chart-state">Aucune position détenue sur cette période.</div>
+          ) : hist.status === "needs" ? (
+            <div className="rc-chart-state">
+              <span>
+                La courbe nécessite l'historique des cours de {hist.missing} actif(s), soit {hist.missing} requête(s) CoinGecko.
+              </span>
+              <button type="button" className="rc-btn sm primary" onClick={onEnableHistory}>
+                <Icon name="download" size={15} /> Charger l'évolution
+              </button>
+            </div>
           ) : hist.status === "loading" ? (
             <div className="rc-chart-state" aria-busy="true">
               <span className="rc-skel" style={{ width: "70%", height: 10 }} />
@@ -3313,7 +3362,14 @@ function PortfolioView({
           </div>
           {loadingPrices ? (
             <div className="rc-chart-state" style={{ height: 200 }} aria-busy="true">
-              Chargement des cours…
+              Synchronisation des cours…
+            </div>
+          ) : noPrices ? (
+            <div className="rc-chart-state" style={{ height: 200 }}>
+              <span>La répartition se calcule à partir des cours du jour.</span>
+              <button type="button" className="rc-btn sm primary" onClick={onSync}>
+                <Icon name="refresh" size={15} /> Synchroniser les cours
+              </button>
             </div>
           ) : slices.length ? (
             <AllocationChart slices={slices} total={totals.value} currency={currency} />
@@ -3706,7 +3762,7 @@ const MarketRow = memo(function MarketRow({ coin, currency, starred, onToggleSta
   );
 });
 
-function MarketView({ market, watchlist, directory, onToggleStar, onAlert, onOpen, remoteSearch, sentiment }) {
+function MarketView({ market, watchlist, directory, onToggleStar, onAlert, onOpen, onSync, unsyncedCount, remoteSearch, sentiment }) {
   const [tab, setTab] = useState("top");
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState({ key: "rank", dir: 1 });
@@ -3750,7 +3806,22 @@ function MarketView({ market, watchlist, directory, onToggleStar, onAlert, onOpe
       setRemote({ status: "error", items: [], query: q, error: err });
     }
   };
-  const loading = market.status === "loading" && !market.coins.length;
+  const loading = market.refreshing && !market.coins.length;
+
+  if (market.status === "idle" && !market.refreshing) {
+    return (
+      <div className="rc-empty">
+        <h3>Cours non synchronisés</h3>
+        <p>
+          La synchronisation avec CoinGecko se fait uniquement à votre demande : une requête pour le top 100, plus une pour les actifs que vous suivez
+          hors du top 100. Les cours, variations, mini-graphiques et scores d'opportunité s'affichent ensuite ici.
+        </p>
+        <button type="button" className="rc-btn primary" onClick={onSync}>
+          <Icon name="refresh" size={16} /> Synchroniser les cours
+        </button>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -3925,6 +3996,7 @@ function MarketView({ market, watchlist, directory, onToggleStar, onAlert, onOpe
           : market.updatedAt
             ? `Cours au ${fmtDay(market.updatedAt)} à ${fmtTime(market.updatedAt)} · source CoinGecko · devise ${cur}.`
             : "Source CoinGecko."}{" "}
+        {unsyncedCount > 0 && `${unsyncedCount} actif(s) suivi(s) sans cours : ils seront cotés à la prochaine synchronisation. `}
         Score d'opportunité : indicateur technique de 0 à 100 (décote, repli, tendance, RSI). Touchez un actif pour le détail et ses seuils clés.
       </p>
     </>
@@ -3943,7 +4015,7 @@ function AlertsView({ alerts, priceMap, currency, conv, onNew, onEdit, onDelete,
       <div className="rc-empty">
         <h3>Aucune alerte de prix</h3>
         <p>
-          Une alerte surveille le cours d'une crypto à chaque actualisation (toutes les 60 secondes) et affiche une notification dans l'application
+          Une alerte compare le cours d'une crypto à votre seuil à chaque synchronisation des cours et affiche une notification dans l'application
           quand le seuil est franchi, à la hausse ou à la baisse.
         </p>
         <button type="button" className="rc-btn primary" onClick={() => onNew(null)}>
@@ -3957,7 +4029,7 @@ function AlertsView({ alerts, priceMap, currency, conv, onNew, onEdit, onDelete,
     <>
       <div className="rc-section-head">
         <p className="rc-footnote">
-          {active.length} alerte(s) active(s) · {fired.length} déclenchée(s) · vérification à chaque actualisation des cours
+          {active.length} alerte(s) active(s) · {fired.length} déclenchée(s) · vérifiées à chaque synchronisation des cours
         </p>
         <button type="button" className="rc-btn primary sm" onClick={() => onNew(null)}>
           <Icon name="plus" size={15} /> Nouvelle alerte
@@ -4114,11 +4186,12 @@ function AlertsView({ alerts, priceMap, currency, conv, onNew, onEdit, onDelete,
 
 /* ─────────────────────────── Vue Paramètres ─────────────────────────── */
 
-function SettingsView({ settings, onCurrency, onTheme, market, nextAt, onRefresh, onExportJSON, onImportJSON, onReset, dirty, lastBackupAt, counts }) {
+function SettingsView({ settings, onCurrency, onTheme, market, onSync, rateLimited, onExportJSON, onImportJSON, onReset, dirty, lastBackupAt, counts }) {
   const [confirmReset, setConfirmReset] = useState(false);
   const statusText = {
-    live: "En direct",
-    stale: "Données en cache (dernière actualisation échouée)",
+    idle: "Pas encore synchronisé",
+    live: "Synchronisé",
+    stale: "Derniers cours reçus (dernière synchronisation échouée)",
     demo: "Démonstration : cours simulés",
     loading: "Connexion en cours",
   }[market.status];
@@ -4196,17 +4269,27 @@ function SettingsView({ settings, onCurrency, onTheme, market, nextAt, onRefresh
           <dd>API publique CoinGecko (sans clé)</dd>
           <dt>Statut</dt>
           <dd>{statusText}</dd>
-          <dt>Dernière mise à jour</dt>
-          <dd>{market.updatedAt ? `${fmtDay(market.updatedAt)} à ${fmtTime(market.updatedAt)}` : "—"}</dd>
-          <dt>Prochaine</dt>
-          <dd>{market.refreshing ? "en cours…" : nextAt ? <>dans <Countdown target={nextAt} /></> : "—"}</dd>
-          <dt>Fréquence</dt>
-          <dd>60 s, requêtes espacées, pause progressive (jusqu'à 5 min) après un refus ou une erreur</dd>
+          <dt>Dernière synchronisation</dt>
+          <dd>
+            {market.updatedAt ? (
+              <>
+                {fmtDay(market.updatedAt)} à {fmtTime(market.updatedAt)} (<SyncAge ts={market.updatedAt} />)
+              </>
+            ) : (
+              "jamais"
+            )}
+          </dd>
+          <dt>Mode</dt>
+          <dd>Manuel : aucune requête sans clic sur « Synchroniser »</dd>
+          <dt>Requêtes par synchronisation</dt>
+          <dd>1 à 3 : top 100, actifs suivis hors top 100, taux de change si besoin</dd>
+          <dt>Historique</dt>
+          <dd>Chargé à la demande (courbe de valeur, fiche d'un actif), puis réutilisé</dd>
         </dl>
         {market.error && <p className="rc-help">Dernier incident : {describeError(market.error)}.</p>}
         <div className="rc-actions">
-          <button type="button" className="rc-btn" onClick={onRefresh} disabled={market.refreshing || client.blockedKind() === "rate_limited"}>
-            <Icon name="refresh" size={16} className={market.refreshing ? "rc-spin" : undefined} /> Actualiser maintenant
+          <button type="button" className="rc-btn primary" onClick={onSync} disabled={market.refreshing || rateLimited}>
+            <Icon name="refresh" size={16} className={market.refreshing ? "rc-spin" : undefined} /> {market.refreshing ? "Synchronisation…" : "Synchroniser maintenant"}
           </button>
         </div>
       </section>
@@ -4256,19 +4339,17 @@ export default function RegistreCrypto() {
   const [saved, setSaved] = useState(() => ({ ...initial, at: null }));
   const [view, setView] = useState("portefeuille");
   const [period, setPeriod] = useState(30);
-  const [market, setMarket] = useState({ status: "loading", currency: "EUR", coins: [], extras: [], updatedAt: null, error: null, refreshing: false });
+  const [market, setMarket] = useState({ status: "idle", currency: "EUR", coins: [], extras: [], updatedAt: null, error: null, refreshing: false });
   const [rates, setRates] = useState(null);
   const [remoteCoins, setRemoteCoins] = useState(() => new Map());
-  const [nextAt, setNextAt] = useState(null);
   const [toasts, setToasts] = useState([]);
   const [dialog, setDialog] = useState(null);
   const [sentiment, setSentiment] = useState(null);
+  const [historyEnabled, setHistoryEnabled] = useState(false);
+  const [, setWake] = useState(0);
 
-  const timerRef = useRef(null);
   const inflightRef = useRef(false);
-  const pendingRef = useRef(false);
   const demoRef = useRef(null);
-  const refreshRef = useRef(null);
   const toastSeq = useRef(0);
 
   const currency = settings.currency;
@@ -4276,8 +4357,10 @@ export default function RegistreCrypto() {
     () => [...new Set([...transactions.map((t) => t.coinId), ...watchlist, ...alerts.map((a) => a.coinId)])].sort(),
     [transactions, watchlist, alerts],
   );
+  // Taux de change nécessaires si un montant est libellé dans une autre devise que celle d'affichage.
+  const needsFx = transactions.some((t) => t.currency !== currency) || alerts.some((a) => a.currency !== currency);
   const liveRef = useRef({});
-  liveRef.current = { currency, trackedIds, market };
+  liveRef.current = { currency, trackedIds, market, needsFx };
 
   /* Notifications */
   const dismissToast = useCallback((id) => setToasts((ts) => ts.filter((t) => t.id !== id)), []);
@@ -4297,90 +4380,97 @@ export default function RegistreCrypto() {
     [dismissToast],
   );
 
-  /* Actualisation des cours */
-  const schedule = useCallback(() => {
-    clearTimeout(timerRef.current);
-    const at = Math.max(Date.now() + REFRESH_MS, client.blockedUntil());
-    setNextAt(at);
-    timerRef.current = setTimeout(() => {
-      if (typeof document !== "undefined" && document.hidden) {
-        pendingRef.current = true;
-        return;
-      }
-      if (refreshRef.current) refreshRef.current();
-    }, at - Date.now());
+  /* Indice Fear & Greed (facultatif) : chargé avec chaque synchronisation. */
+  const loadSentiment = useCallback(async () => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+    try {
+      const res = await fetch(PATHS.sentiment, { signal: ctrl.signal });
+      if (!res.ok) return;
+      const d = await res.json();
+      const x = d && Array.isArray(d.data) ? d.data[0] : null;
+      const value = x ? Number(x.value) : NaN;
+      if (isNum(value)) setSentiment({ value, label: FNG_LABELS[x.value_classification] || x.value_classification || "" });
+    } catch (e) {
+      /* indicateur facultatif : on n'affiche rien */
+    } finally {
+      clearTimeout(timer);
+    }
   }, []);
 
-  const refresh = useCallback(
-    async ({ manual = false, topTtl } = {}) => {
-      if (inflightRef.current) return;
-      inflightRef.current = true;
-      clearTimeout(timerRef.current);
-      const cur = liveRef.current.currency;
-      const ccy = cur.toLowerCase();
-      if (manual && client.blockedKind() !== "rate_limited") client.resetBackoff();
-      setMarket((m) => ({ ...m, refreshing: true }));
-      let next;
-      try {
-        const top = await client.request(PATHS.top(ccy), { ttl: topTtl != null ? topTtl : manual ? 10_000 : 20_000 });
-        const coins = normalizeList(top.data);
-        if (!coins.length) throw new ApiError("parse", "Liste vide");
-        const known = new Set(coins.map((c) => c.id));
-        const extraIds = liveRef.current.trackedIds.filter((id) => !known.has(id));
-        let extras = [];
-        if (extraIds.length) {
-          try {
-            const r = await client.request(PATHS.ids(ccy, extraIds), { ttl: 20_000 });
-            extras = normalizeList(r.data);
-          } catch (err) {
-            const prev = liveRef.current.market;
-            extras = prev.currency === cur ? prev.extras.filter((c) => extraIds.includes(c.id)) : [];
-          }
-        }
-        next = { status: top.stale ? "stale" : "live", currency: cur, coins, extras, updatedAt: top.ts, error: top.stale ? top.error : null, refreshing: false };
-      } catch (err) {
-        const prev = liveRef.current.market;
-        if (prev.currency === cur && prev.coins.length && prev.status !== "demo") {
-          next = { ...prev, status: "stale", error: err, refreshing: false };
-        } else {
-          if (!demoRef.current) demoRef.current = createDemoState();
-          else advanceDemo(demoRef.current);
-          next = { status: "demo", currency: cur, coins: demoMarket(demoRef.current, cur), extras: [], updatedAt: Date.now(), error: err, refreshing: false };
+  /**
+   * Synchronisation CoinGecko, uniquement sur clic : top 100, actifs suivis hors top 100,
+   * taux de change si nécessaire. Aucune requête automatique ni périodique.
+   */
+  const sync = useCallback(async () => {
+    if (inflightRef.current) return;
+    inflightRef.current = true;
+    const { currency: cur, trackedIds: ids, needsFx: fx } = liveRef.current;
+    const ccy = cur.toLowerCase();
+    if (client.blockedKind() !== "rate_limited") client.resetBackoff();
+    setMarket((m) => ({ ...m, refreshing: true }));
+    let next;
+    try {
+      const top = await client.request(PATHS.top(ccy));
+      const coins = normalizeList(top.data);
+      if (!coins.length) throw new ApiError("parse", "Liste vide");
+      const known = new Set(coins.map((c) => c.id));
+      const extraIds = ids.filter((id) => !known.has(id));
+      let extras = [];
+      if (extraIds.length) {
+        try {
+          const r = await client.request(PATHS.ids(ccy, extraIds));
+          extras = normalizeList(r.data);
+        } catch (err) {
+          const prev = liveRef.current.market;
+          extras = prev.currency === cur ? prev.extras.filter((c) => extraIds.includes(c.id)) : [];
         }
       }
-      setMarket(next);
-      inflightRef.current = false;
-      schedule();
-      if (liveRef.current.currency !== cur && refreshRef.current) refreshRef.current({ manual: true });
-    },
-    [schedule],
-  );
-  refreshRef.current = refresh;
+      next = { status: top.stale ? "stale" : "live", currency: cur, coins, extras, updatedAt: top.ts, error: top.stale ? top.error : null, refreshing: false };
+    } catch (err) {
+      const prev = liveRef.current.market;
+      if (prev.currency === cur && prev.coins.length && prev.status !== "demo") {
+        next = { ...prev, status: "stale", error: err, refreshing: false };
+      } else {
+        if (!demoRef.current) demoRef.current = createDemoState();
+        else advanceDemo(demoRef.current);
+        next = { status: "demo", currency: cur, coins: demoMarket(demoRef.current, cur), extras: [], updatedAt: Date.now(), error: err, refreshing: false };
+      }
+    }
+    if (fx) {
+      if (next.status === "demo") {
+        setRates((r) => (r && r.source === "live" ? r : { values: DEMO_FX, source: "demo" }));
+      } else {
+        try {
+          const r = await client.request(PATHS.rates());
+          const values = {};
+          const src = (r.data && r.data.rates) || {};
+          for (const code of CURRENCY_CODES) {
+            const v = src[code.toLowerCase()] && src[code.toLowerCase()].value;
+            if (isNum(v) && v > 0) values[code.toLowerCase()] = v;
+          }
+          if (Object.keys(values).length >= 2) setRates({ values, source: "live", ts: r.ts });
+        } catch (e) {
+          /* conversion indisponible : signalée par une bannière */
+        }
+      }
+    }
+    setMarket(next);
+    inflightRef.current = false;
+    if (next.status !== "demo") loadSentiment();
+  }, [loadSentiment]);
 
   useEffect(() => {
     initDownloadsCapability();
-    refresh();
-    const onVisible = () => {
-      if (!document.hidden && pendingRef.current) {
-        pendingRef.current = false;
-        if (refreshRef.current) refreshRef.current();
-      }
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      clearTimeout(timerRef.current);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, [refresh]);
+  }, []);
 
-  const firstCurrency = useRef(true);
+  // Réactive les boutons à la fin d'une pause imposée par CoinGecko (HTTP 429).
   useEffect(() => {
-    if (firstCurrency.current) {
-      firstCurrency.current = false;
-      return;
-    }
-    refresh({ manual: true });
-  }, [currency, refresh]);
+    const wait = client.blockedUntil() - Date.now();
+    if (wait <= 0) return undefined;
+    const t = setTimeout(() => setWake((n) => n + 1), wait + 100);
+    return () => clearTimeout(t);
+  }, [market]);
 
   // Transitions de statut → notification
   const prevStatus = useRef(null);
@@ -4392,8 +4482,8 @@ export default function RegistreCrypto() {
     if (s === "live" && (p === "demo" || p === "stale")) {
       pushToast({ kind: "success", title: "Connexion à CoinGecko rétablie", body: "Les cours affichés sont de nouveau les cours réels." });
     } else if (s === "stale" && p === "live") {
-      pushToast({ kind: "warning", title: "Actualisation impossible", body: `Affichage des dernières données reçues (${describeError(market.error)}).` });
-    } else if (s === "demo" && p === "loading") {
+      pushToast({ kind: "warning", title: "Synchronisation impossible", body: `Affichage des derniers cours reçus (${describeError(market.error)}).` });
+    } else if (s === "demo" && p === "idle") {
       pushToast({ kind: "warning", title: "Mode démonstration", body: "CoinGecko est injoignable : les cours affichés sont simulés." });
     }
   }, [market.status, market.error, pushToast]);
@@ -4408,73 +4498,8 @@ export default function RegistreCrypto() {
     });
     return m;
   }, [market, currency]);
-  const pricesReady = market.status !== "loading" && market.currency === currency;
-
-  // Nouvel actif suivi hors top 100 : récupère son cours sans attendre le cycle.
-  const missingKey = pricesReady ? trackedIds.filter((id) => !priceMap.has(id)).join(",") : "";
-  useEffect(() => {
-    if (!missingKey || market.status === "demo") return undefined;
-    const t = setTimeout(() => refreshRef.current && refreshRef.current({ topTtl: 55_000 }), 400);
-    return () => clearTimeout(t);
-  }, [missingKey, market.status]);
-
-  // Taux de change (seulement si une devise de saisie diffère de la devise d'affichage)
-  const needsFx = transactions.some((t) => t.currency !== currency) || alerts.some((a) => a.currency !== currency);
-  const fxMode = market.status === "loading" ? null : market.status === "demo" ? "demo" : "live";
-  const fxSlot = Math.floor(Date.now() / 1_800_000);
-  useEffect(() => {
-    if (!needsFx || !fxMode) return undefined;
-    if (fxMode === "demo") {
-      setRates((r) => r || { values: DEMO_FX, source: "demo" });
-      return undefined;
-    }
-    let off = false;
-    client
-      .request(PATHS.rates(), { ttl: 1_800_000 })
-      .then((r) => {
-        if (off) return;
-        const values = {};
-        const src = (r.data && r.data.rates) || {};
-        for (const code of CURRENCY_CODES) {
-          const v = src[code.toLowerCase()] && src[code.toLowerCase()].value;
-          if (isNum(v) && v > 0) values[code.toLowerCase()] = v;
-        }
-        if (Object.keys(values).length >= 2) setRates({ values, source: "live", ts: r.ts });
-      })
-      .catch(() => {});
-    return () => {
-      off = true;
-    };
-  }, [needsFx, fxMode, fxSlot]);
-
-  // Sentiment global (indice Fear & Greed) : facultatif, rafraîchi toutes les 30 min.
-  const marketReachable = market.status === "live" || market.status === "stale";
-  useEffect(() => {
-    if (!marketReachable) return undefined;
-    let off = false;
-    const load = async () => {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
-      try {
-        const res = await fetch(PATHS.sentiment, { signal: ctrl.signal });
-        if (!res.ok) return;
-        const d = await res.json();
-        const x = d && Array.isArray(d.data) ? d.data[0] : null;
-        const value = x ? Number(x.value) : NaN;
-        if (!off && isNum(value)) setSentiment({ value, label: FNG_LABELS[x.value_classification] || x.value_classification || "" });
-      } catch (e) {
-        /* indicateur facultatif : on n'affiche rien */
-      } finally {
-        clearTimeout(timer);
-      }
-    };
-    load();
-    const every = setInterval(load, 1_800_000);
-    return () => {
-      off = true;
-      clearInterval(every);
-    };
-  }, [marketReachable]);
+  const pricesReady = market.status !== "idle" && market.coins.length > 0 && market.currency === currency;
+  const unsyncedIds = pricesReady && market.status !== "demo" ? trackedIds.filter((id) => !priceMap.has(id)) : [];
 
   const conv = useMemo(() => {
     const values = rates && rates.values;
@@ -4595,15 +4620,22 @@ export default function RegistreCrypto() {
     [directory],
   );
 
+  // Historique : d'abord le cache ; le réseau seulement sur action (période, bouton, ouverture d'une fiche).
   const loadHistory = useCallback(
-    async (id, days, mode) => {
+    async (id, days, mode, { cacheOnly = false } = {}) => {
       if (mode === "demo") {
         if (!demoRef.current) demoRef.current = createDemoState();
         return demoHistory(demoRef.current, id, days, currency);
       }
-      const r = await client.request(PATHS.history(id, currency.toLowerCase(), days), { ttl: days <= 30 ? 900_000 : 3_600_000 });
-      const prices = r.data && r.data.prices;
-      return Array.isArray(prices) ? prices.filter((p) => Array.isArray(p) && isNum(p[0]) && isNum(p[1])) : null;
+      const path = PATHS.history(id, currency.toLowerCase(), days);
+      const clean = (data) =>
+        data && Array.isArray(data.prices) ? data.prices.filter((p) => Array.isArray(p) && isNum(p[0]) && isNum(p[1])) : null;
+      if (cacheOnly) {
+        const hit = client.peek(path);
+        return hit ? clean(hit.data) : null;
+      }
+      const r = await client.request(path, { ttl: 6 * 3_600_000 });
+      return clean(r.data);
     },
     [currency],
   );
@@ -4788,11 +4820,29 @@ export default function RegistreCrypto() {
   const rateLimited = client.blockedKind() === "rate_limited";
   const viewDef = VIEWS.find((v) => v.id === view);
 
-  const retryButton = (
-    <button type="button" className="rc-btn sm" onClick={() => refresh({ manual: true })} disabled={market.refreshing || rateLimited}>
-      {market.refreshing ? "Actualisation…" : "Réessayer"}
+  const syncButton = (label = "Synchroniser", primary = false) => (
+    <button
+      type="button"
+      className={`rc-btn sm${primary ? " primary" : ""}`}
+      onClick={sync}
+      disabled={market.refreshing || rateLimited}
+      aria-label={market.refreshing ? "Synchronisation en cours" : `${label} : récupérer les cours CoinGecko`}
+      title={rateLimited ? "Limite de requêtes CoinGecko atteinte : patientez" : "Récupérer les cours CoinGecko"}
+    >
+      <Icon name="refresh" size={15} className={market.refreshing ? "rc-spin" : undefined} />
+      <span className="rc-hide-xs">{market.refreshing ? "Synchronisation…" : label}</span>
     </button>
   );
+  const syncStatus = market.refreshing ? (
+    "Synchronisation…"
+  ) : market.updatedAt ? (
+    <>
+      Synchro à {fmtTime(market.updatedAt)} · <SyncAge ts={market.updatedAt} />
+    </>
+  ) : (
+    "Jamais synchronisé"
+  );
+  const currencyMismatch = market.status !== "idle" && market.coins.length > 0 && market.currency !== currency;
 
   const navItems = VIEWS.map((v) => ({
     ...v,
@@ -4826,24 +4876,8 @@ export default function RegistreCrypto() {
           </nav>
           <div className="rc-rail-foot">
             <StatusPill status={market.status} />
-            <span>
-              {market.refreshing ? (
-                "Actualisation…"
-              ) : market.updatedAt ? (
-                <>
-                  MAJ {fmtTime(market.updatedAt)}
-                  {nextAt && (
-                    <>
-                      {" "}
-                      · prochaine dans <Countdown target={nextAt} />
-                    </>
-                  )}
-                </>
-              ) : (
-                "En attente des cours"
-              )}
-            </span>
-            <span>Données CoinGecko · devise {currency}</span>
+            <span>{syncStatus}</span>
+            <span>Données CoinGecko · devise {currency} · synchronisation manuelle</span>
           </div>
         </aside>
 
@@ -4855,44 +4889,43 @@ export default function RegistreCrypto() {
               </span>
             </div>
             <h1 className="rc-top-title">{viewDef.title}</h1>
-            <span className="rc-top-meta">
-              {market.refreshing ? (
-                "Actualisation…"
-              ) : market.updatedAt ? (
-                <>
-                  MAJ {fmtTime(market.updatedAt)} · prochaine dans <Countdown target={nextAt} />
-                </>
-              ) : null}
-            </span>
+            <span className="rc-top-meta">{syncStatus}</span>
             <StatusPill status={market.status} />
             {unsaved && (
               <button type="button" className="rc-btn sm" onClick={exportJSON} title="Exporter une sauvegarde JSON" aria-label="Sauvegarder : modifications non exportées">
                 <span className="rc-dirty" /> <span className="rc-hide-xs">Sauvegarder</span>
               </button>
             )}
-            <button
-              type="button"
-              className="rc-icon-btn"
-              onClick={() => refresh({ manual: true })}
-              disabled={market.refreshing || rateLimited}
-              aria-label="Actualiser les cours"
-              title={rateLimited ? "Limite CoinGecko atteinte : patientez" : "Actualiser les cours"}
-            >
-              <Icon name="refresh" size={17} className={market.refreshing ? "rc-spin" : undefined} />
-            </button>
+            {syncButton("Synchroniser", true)}
           </header>
 
           <main className="rc-content">
+            {market.status === "idle" && !market.refreshing && view !== "marche" && view !== "parametres" && (
+              <Banner tone="info" icon="info" title="Cours non synchronisés" action={syncButton("Synchroniser", true)}>
+                Aucune requête n'est envoyée à CoinGecko sans votre accord. Touchez « Synchroniser » pour charger les cours ; les valeurs, plus-values et
+                alertes seront alors calculées.
+              </Banner>
+            )}
+            {currencyMismatch && !market.refreshing && (
+              <Banner tone="info" icon="info" title={`Devise d'affichage : ${currency}`} action={syncButton("Synchroniser")}>
+                Les cours chargés sont en {market.currency}. Synchronisez pour les obtenir en {currency}.
+              </Banner>
+            )}
             {market.status === "demo" && (
-              <Banner tone="demo" title="Mode démonstration : cours simulés" action={retryButton}>
+              <Banner tone="demo" title="Mode démonstration : cours simulés" action={syncButton("Réessayer")}>
                 CoinGecko n'a pas pu être joint ({describeError(market.error)}) et aucune donnée réelle n'a encore été reçue. Les prix, variations et
-                graphiques affichés sont fictifs. Nouvel essai automatique dans <Countdown target={nextAt} />.
+                graphiques affichés sont fictifs.
               </Banner>
             )}
             {market.status === "stale" && (
-              <Banner tone="warn" title={`Données en cache du ${market.updatedAt ? fmtTime(market.updatedAt) : "—"}`} action={retryButton}>
-                La dernière actualisation a échoué ({describeError(market.error)}). Les cours affichés sont les derniers reçus. Nouvel essai dans{" "}
-                <Countdown target={nextAt} />.
+              <Banner tone="warn" title={`Synchronisation échouée : cours du ${market.updatedAt ? fmtTime(market.updatedAt) : "—"} affichés`} action={syncButton("Réessayer")}>
+                {describeError(market.error)}. Les cours affichés sont ceux de la dernière synchronisation réussie.
+                {rateLimited && (
+                  <>
+                    {" "}
+                    Nouvel essai possible dans <Countdown target={client.blockedUntil()} />.
+                  </>
+                )}
               </Banner>
             )}
             {fxMissing && view !== "marche" && (
@@ -4910,6 +4943,10 @@ export default function RegistreCrypto() {
                 conv={conv}
                 marketStatus={market.status}
                 pricesReady={pricesReady}
+                syncing={market.refreshing}
+                onSync={sync}
+                historyEnabled={historyEnabled}
+                onEnableHistory={() => setHistoryEnabled(true)}
                 loadHistory={loadHistory}
                 period={period}
                 setPeriod={setPeriod}
@@ -4938,6 +4975,8 @@ export default function RegistreCrypto() {
                 onToggleStar={toggleStar}
                 onAlert={openAlert}
                 onOpen={openCoin}
+                onSync={sync}
+                unsyncedCount={unsyncedIds.length}
                 remoteSearch={remoteSearch}
                 sentiment={sentiment}
               />
@@ -4960,8 +4999,8 @@ export default function RegistreCrypto() {
                 onCurrency={(c) => setSettings((s) => ({ ...s, currency: c }))}
                 onTheme={(t) => setSettings((s) => ({ ...s, theme: t }))}
                 market={market}
-                nextAt={nextAt}
-                onRefresh={() => refresh({ manual: true })}
+                onSync={sync}
+                rateLimited={rateLimited}
                 onExportJSON={exportJSON}
                 onImportJSON={() => setDialog({ type: "import", format: "json" })}
                 onReset={resetAll}
