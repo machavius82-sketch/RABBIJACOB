@@ -599,12 +599,51 @@ function computeKeyLevels(points, current, ath) {
 // Seuils indicatifs des trois signaux de rotation.
 const ROTATION = { dominanceMax: 57, shareMin: 75, altCount: 50 };
 
+const DOMINANCE_HISTORY_MAX = 1000;
+const MIN_READING_DATE = "2013-01-01";
+
+/** Lundi 0 h (heure locale) de la semaine contenant ts. */
+function weekStart(ts) {
+  const d = new Date(ts);
+  const day = (d.getDay() + 6) % 7;
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() - day).getTime();
+}
+/** Clôture hebdomadaire = dernier relevé de chaque semaine (lundi-dimanche). */
+function weeklyCloses(history) {
+  const byWeek = new Map();
+  for (const r of [...history].sort((a, b) => a.ts - b.ts)) {
+    const k = weekStart(r.ts);
+    const w = byWeek.get(k) || { week: k, count: 0 };
+    w.count += 1;
+    w.ts = r.ts;
+    w.btc = r.btc;
+    w.source = r.source;
+    byWeek.set(k, w);
+  }
+  return [...byWeek.values()].sort((a, b) => a.week - b.week);
+}
+/**
+ * Règle du plan : deux clôtures hebdomadaires consécutives sous le seuil,
+ * sur les deux dernières semaines terminées (la semaine en cours n'est pas close).
+ */
+function dominanceWeeklySignal(history, now = Date.now()) {
+  const current = weekStart(now);
+  const closed = weeklyCloses(history).filter((w) => w.week < current);
+  if (closed.length < 2) return { status: "insufficient", closed };
+  const [a, b] = closed.slice(-2);
+  const consecutive = Math.round((b.week - a.week) / (7 * DAY_MS)) === 1;
+  const recent = Math.round((current - b.week) / (7 * DAY_MS)) === 1;
+  if (!consecutive || !recent) return { status: "gap", closed, last2: [a, b] };
+  const met = a.btc < ROTATION.dominanceMax && b.btc < ROTATION.dominanceMax;
+  return { status: met ? "met" : "not", closed, last2: [a, b] };
+}
+
 /**
  * Dominance du bitcoin (CoinGecko /global si disponible, sinon calculée sur le top 100),
  * tendance de la dominance sur 30 jours estimée à partir du top 100 (offre supposée constante),
  * ratio ETH/BTC et part des altcoins du top 50 (hors stablecoins) qui font mieux que le bitcoin sur 30 jours.
  */
-function computeRotation(coins, global) {
+function computeRotation(coins, global, weekly) {
   const btc = coins.find((c) => c.id === "bitcoin");
   if (!btc || !isNum(btc.mcap)) return null;
   const eth = coins.find((c) => c.id === "ethereum");
@@ -623,7 +662,9 @@ function computeRotation(coins, global) {
   const beating = alts.filter((c) => relChange(c.change30d, btc.change30d) > 0).length;
   const share = alts.length ? (beating / alts.length) * 100 : null;
   const signals = [
-    { key: "dominance", label: `Dominance du bitcoin sous ${ROTATION.dominanceMax} %`, met: dominance < ROTATION.dominanceMax },
+    weekly && (weekly.status === "met" || weekly.status === "not")
+      ? { key: "dominance", label: `Dominance du bitcoin sous ${ROTATION.dominanceMax} % sur 2 clôtures hebdomadaires`, met: weekly.status === "met" }
+      : { key: "dominance", label: `Dominance du bitcoin sous ${ROTATION.dominanceMax} % (valeur actuelle)`, met: dominance < ROTATION.dominanceMax },
     { key: "ethbtc", label: "ETH/BTC en hausse sur 30 jours", met: isNum(ethBtc30) && ethBtc30 > 0 },
     { key: "share", label: `Au moins ${ROTATION.shareMin} % des altcoins du top ${ROTATION.altCount} devant le bitcoin`, met: isNum(share) && share >= ROTATION.shareMin },
   ];
@@ -1227,9 +1268,9 @@ function analyzeCSV(text, { resolveCoin, defaultCurrency, existing }) {
 
 /* ─────────────────────────── Sauvegarde JSON ─────────────────────────── */
 
-function buildBackup({ settings, transactions, watchlist, alerts }) {
+function buildBackup({ settings, transactions, watchlist, alerts, dominanceHistory = [] }) {
   return JSON.stringify(
-    { format: BACKUP_FORMAT, version: 1, exportedAt: new Date().toISOString(), settings, transactions, watchlist, alerts },
+    { format: BACKUP_FORMAT, version: 1, exportedAt: new Date().toISOString(), settings, transactions, watchlist, alerts, dominanceHistory },
     null,
     2,
   );
@@ -1305,9 +1346,20 @@ function parseBackup(text) {
   const settings = {};
   if (CURRENCY_CODES.includes(s.currency)) settings.currency = s.currency;
   if (s.theme === "light" || s.theme === "dark") settings.theme = s.theme;
+  const dominanceHistory = (Array.isArray(obj.dominanceHistory) ? obj.dominanceHistory : [])
+    .filter((r) => r && isNum(r.ts) && isNum(r.btc) && r.btc > 0 && r.btc < 100)
+    .map((r) => ({
+      ts: r.ts,
+      btc: r.btc,
+      ethBtc: isNum(r.ethBtc) ? r.ethBtc : null,
+      share: isNum(r.share) ? r.share : null,
+      source: r.source === "manuel" ? "manuel" : "synchro",
+    }))
+    .sort((a, b) => a.ts - b.ts)
+    .slice(-DOMINANCE_HISTORY_MAX);
   return {
     ok: true,
-    data: { transactions, watchlist, alerts, settings },
+    data: { transactions, watchlist, alerts, settings, dominanceHistory },
     exportedAt: typeof obj.exportedAt === "string" ? obj.exportedAt : null,
   };
 }
@@ -1768,6 +1820,9 @@ button.rc-score:hover{filter:brightness(.94)}
 .rc-signals{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center}
 .rc-signal{display:inline-flex;align-items:center;gap:5px;padding:3px 9px 3px 6px;border-radius:999px;font-size:12px;font-weight:600;background:var(--surface-3);color:var(--ink-2)}
 .rc-signal.on{background:var(--accent-soft);color:var(--accent)}
+.rc-history-summary{display:flex;align-items:center;justify-content:space-between;gap:8px 12px;flex-wrap:wrap;font-size:13px}
+.rc-history-form{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.rc-history-form .rc-field{flex:1 1 140px}
 .rc-gauge{position:relative;flex:1 1 140px;max-width:260px;height:6px;border-radius:3px;background:linear-gradient(90deg,var(--s2),var(--surface-3) 50%,var(--s1))}
 .rc-gauge i{position:absolute;top:-4px;width:4px;height:14px;border-radius:2px;background:var(--ink);transform:translateX(-50%)}
 @media (prefers-reduced-motion:reduce){.rc *,.rc *::before{animation:none!important;transition:none!important}}
@@ -3767,6 +3822,264 @@ function CoinSheet({ coin, currency, demo, starred, alerts, loadLevels, onToggle
 
 /* ─────────────────────────── Vue Marché ─────────────────────────── */
 
+function DominanceTooltip({ active, payload, label }) {
+  if (!active || !payload || !payload.length) return null;
+  const r = payload[0].payload;
+  return (
+    <div className="rc-tip">
+      <div className="rc-tip-date">{fmtDayTime(label)}</div>
+      <div className="rc-tip-row">
+        <span>Dominance</span>
+        <b>{fmtPct(r.btc, false)}</b>
+      </div>
+      <div className="rc-tip-row">
+        <span>Source</span>
+        <b>{r.source === "manuel" ? "saisie manuelle" : "synchronisation"}</b>
+      </div>
+    </div>
+  );
+}
+
+function DominanceHistory({ history, weekly, demo, onAdd, onRemoveWeek, onClear }) {
+  const [open, setOpen] = useState(false);
+  const [date, setDate] = useState(todayISO());
+  const [value, setValue] = useState("");
+  const [errors, setErrors] = useState({});
+  const [confirmClear, setConfirmClear] = useState(false);
+  const closes = useMemo(() => weeklyCloses(history), [history]);
+  const recent = closes.slice(-2);
+  const max = ROTATION.dominanceMax;
+  const signalText = {
+    met: `Oui : les deux dernières semaines terminées ont clôturé sous ${max} %.`,
+    not: `Non : au moins une des deux dernières semaines terminées a clôturé à ${max} % ou plus.`,
+    gap: "Indéterminé : il manque un relevé dans l'une des deux dernières semaines terminées.",
+    insufficient: "Indéterminé : il faut au moins deux semaines terminées avec un relevé.",
+  }[weekly.status];
+  const submit = (e) => {
+    e.preventDefault();
+    const iso = parseDateInput(date);
+    const v = parseDecimal(value);
+    const errs = {};
+    if (!iso) errs.date = "Date invalide.";
+    else if (iso > todayISO()) errs.date = "La date ne peut pas être dans le futur.";
+    else if (iso < MIN_READING_DATE) errs.date = "Date antérieure à 2013.";
+    if (!isNum(v) || v <= 0 || v >= 100) errs.value = "La dominance doit être un pourcentage entre 0 et 100.";
+    setErrors(errs);
+    if (Object.keys(errs).length) return;
+    onAdd({ date: iso, btc: v });
+    setValue("");
+  };
+  return (
+    <section className="rc-card rc-context" aria-labelledby="rc-domhist-title">
+      <div className="rc-history-summary">
+        <div>
+          <h2 className="rc-card-title" id="rc-domhist-title">
+            Historique de la dominance
+          </h2>
+          <p className="rc-card-sub">
+            {history.length} relevé(s)
+            {recent.length > 0 &&
+              ` · dernières clôtures : ${recent
+                .map((w) => `${fmtPct(w.btc, false)} (semaine du ${fmtDay(w.week)}${w.week === weekStart(Date.now()) ? ", en cours" : ""})`)
+                .join(", ")}`}
+          </p>
+        </div>
+        <button type="button" className="rc-btn sm" aria-expanded={open} aria-controls="rc-domhist-body" onClick={() => setOpen((o) => !o)}>
+          {open ? "Masquer" : "Afficher l'historique"}
+        </button>
+      </div>
+      {open && (
+        <div id="rc-domhist-body" className="rc-context">
+          <p className="rc-help">
+            Un relevé est enregistré à chaque synchronisation réussie{demo ? " (pas en mode démonstration)" : ""}. Il remplace le précédent s'il date de moins
+            de 15 minutes. La clôture d'une semaine est son dernier relevé, du lundi au dimanche. L'historique est conservé dans la sauvegarde JSON.
+          </p>
+          <p style={{ fontSize: 13 }}>
+            <strong>Deux clôtures hebdomadaires sous {max} % ?</strong> {signalText}
+          </p>
+          {history.length >= 2 ? (
+            <div className="rc-chart" role="img" aria-label={`Évolution de la dominance du bitcoin sur ${history.length} relevés`}>
+              <ResponsiveContainer width="100%" height={200}>
+                <LineChart data={history} margin={{ top: 8, right: 22, bottom: 0, left: 0 }}>
+                  <CartesianGrid vertical={false} stroke="var(--rule)" />
+                  <XAxis
+                    dataKey="ts"
+                    type="number"
+                    scale="time"
+                    domain={["dataMin", "dataMax"]}
+                    tickFormatter={(t) => dtf({ day: "2-digit", month: "2-digit" }).format(t)}
+                    tick={{ fill: "var(--muted)", fontSize: 11 }}
+                    tickLine={false}
+                    axisLine={{ stroke: "var(--rule-2)" }}
+                    minTickGap={28}
+                  />
+                  <YAxis
+                    domain={[(min) => Math.floor(Math.min(min, max) - 1), (top) => Math.ceil(Math.max(top, max) + 1)]}
+                    tickFormatter={(v) => `${nf({ maximumFractionDigits: 1 }).format(v)} %`}
+                    tick={{ fill: "var(--muted)", fontSize: 11 }}
+                    tickLine={false}
+                    axisLine={false}
+                    width={52}
+                  />
+                  <Tooltip content={<DominanceTooltip />} cursor={{ stroke: "var(--rule-2)", strokeWidth: 1 }} />
+                  <ReferenceLine y={max} stroke="var(--s2)" strokeWidth={1.5} strokeDasharray="5 4" />
+                  <Line
+                    type="monotone"
+                    dataKey="btc"
+                    stroke="var(--s1)"
+                    strokeWidth={2}
+                    dot={history.length <= 60 ? { r: 3, stroke: "var(--surface)", strokeWidth: 1.5, fill: "var(--s1)" } : false}
+                    activeDot={{ r: 4, stroke: "var(--surface)", strokeWidth: 2, fill: "var(--s1)" }}
+                    isAnimationActive={false}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+              <div className="rc-legend-inline" style={{ marginTop: 4 }}>
+                <span>
+                  <i className="rc-key" />
+                  Dominance du bitcoin
+                </span>
+                <span>
+                  <i className="rc-key res" />
+                  Seuil de {max} %
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div className="rc-chart-state" style={{ height: 120 }}>
+              Le graphique s'affiche à partir de deux relevés. Synchronisez régulièrement ou saisissez des clôtures passées ci-dessous.
+            </div>
+          )}
+          {closes.length > 0 && (
+            <div className="rc-table-wrap rc-scroll">
+              <table className="rc-table rc-stack">
+                <thead>
+                  <tr>
+                    <th scope="col">Semaine du</th>
+                    <th scope="col" className="num">
+                      Clôture
+                    </th>
+                    <th scope="col">Dernier relevé</th>
+                    <th scope="col" className="num">
+                      Relevés
+                    </th>
+                    <th scope="col">
+                      <span className="rc-sr">Actions</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[...closes]
+                    .reverse()
+                    .slice(0, 12)
+                    .map((w) => (
+                      <tr key={w.week}>
+                        <td className="rc-td-main">
+                          {fmtDay(w.week)}
+                          {w.week === weekStart(Date.now()) ? <span className="rc-muted"> · en cours</span> : null}
+                        </td>
+                        <td className="num" data-label="Clôture">
+                          <strong className={w.btc < max ? "rc-up" : undefined}>{fmtPct(w.btc, false)}</strong>
+                        </td>
+                        <td data-label="Dernier relevé">
+                          {fmtDayTime(w.ts)} <span className="rc-muted">· {w.source === "manuel" ? "saisi" : "synchro"}</span>
+                        </td>
+                        <td className="num" data-label="Relevés">
+                          {w.count}
+                        </td>
+                        <td className="rc-td-actions">
+                          <button type="button" className="rc-icon-btn" onClick={() => onRemoveWeek(w.week)} aria-label={`Supprimer les relevés de la semaine du ${fmtDay(w.week)}`}>
+                            <Icon name="trash" size={16} />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <form className="rc-history-form" onSubmit={submit} noValidate>
+            <div className="rc-field">
+              <label className="rc-label" htmlFor="rc-dom-date">
+                Date du relevé
+              </label>
+              <input
+                id="rc-dom-date"
+                className="rc-input"
+                type="date"
+                min={MIN_READING_DATE}
+                max={todayISO()}
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+                aria-invalid={!!errors.date || undefined}
+                aria-describedby={errors.date ? "rc-dom-date-err" : undefined}
+              />
+              {errors.date && (
+                <p className="rc-error" id="rc-dom-date-err">
+                  {errors.date}
+                </p>
+              )}
+            </div>
+            <div className="rc-field">
+              <label className="rc-label" htmlFor="rc-dom-value">
+                Dominance (%)
+              </label>
+              <input
+                id="rc-dom-value"
+                className="rc-input rc-num"
+                inputMode="decimal"
+                placeholder="57,4"
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                aria-invalid={!!errors.value || undefined}
+                aria-describedby={errors.value ? "rc-dom-value-err" : undefined}
+                autoComplete="off"
+              />
+              {errors.value && (
+                <p className="rc-error" id="rc-dom-value-err">
+                  {errors.value}
+                </p>
+              )}
+            </div>
+            <button type="submit" className="rc-btn">
+              <Icon name="plus" size={15} /> Ajouter un relevé
+            </button>
+          </form>
+          <p className="rc-help">
+            Pour compléter le passé, reprenez la clôture hebdomadaire affichée par TradingView (symbole BTC.D) ou CoinMarketCap. Un relevé saisi est daté
+            de midi ; il remplace un relevé saisi le même jour.
+          </p>
+          {history.length > 0 &&
+            (confirmClear ? (
+              <div className="rc-actions" role="group" aria-label="Confirmer l'effacement de l'historique">
+                <span className="rc-error">Effacer les {history.length} relevé(s) ?</span>
+                <button
+                  type="button"
+                  className="rc-btn danger solid sm"
+                  onClick={() => {
+                    onClear();
+                    setConfirmClear(false);
+                  }}
+                >
+                  Oui, effacer
+                </button>
+                <button type="button" className="rc-btn sm" onClick={() => setConfirmClear(false)}>
+                  Annuler
+                </button>
+              </div>
+            ) : (
+              <div className="rc-actions">
+                <button type="button" className="rc-btn danger sm" onClick={() => setConfirmClear(true)}>
+                  <Icon name="trash" size={15} /> Effacer l'historique
+                </button>
+              </div>
+            ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function MarketContext({ rotation, global, sentiment, demo, currency }) {
   if (!rotation) return null;
   const fmtRatio = (v) => (isNum(v) ? nf({ maximumSignificantDigits: 4 }).format(v) : "—");
@@ -3933,7 +4246,7 @@ const MarketRow = memo(function MarketRow({ coin, currency, starred, onToggleSta
   );
 });
 
-function MarketView({ market, watchlist, directory, onToggleStar, onAlert, onOpen, onSync, unsyncedCount, remoteSearch, sentiment, rotation, global }) {
+function MarketView({ market, watchlist, directory, onToggleStar, onAlert, onOpen, onSync, unsyncedCount, remoteSearch, sentiment, rotation, global, domHistory, domWeekly, onAddReading, onRemoveWeek, onClearHistory }) {
   const [tab, setTab] = useState("top");
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState({ key: "rank", dir: 1 });
@@ -3997,6 +4310,14 @@ function MarketView({ market, watchlist, directory, onToggleStar, onAlert, onOpe
   return (
     <>
       <MarketContext rotation={rotation} global={global} sentiment={sentiment} demo={market.status === "demo"} currency={market.currency} />
+      <DominanceHistory
+        history={domHistory}
+        weekly={domWeekly}
+        demo={market.status === "demo"}
+        onAdd={onAddReading}
+        onRemoveWeek={onRemoveWeek}
+        onClear={onClearHistory}
+      />
       <div className="rc-toolbar">
         <Segmented
           label="Liste affichée"
@@ -4395,7 +4716,7 @@ function SettingsView({ settings, onCurrency, onTheme, market, onSync, rateLimit
         <dl className="rc-dl">
           <dt>Contenu</dt>
           <dd>
-            {counts.transactions} transaction(s), {counts.watchlist} favori(s), {counts.alerts} alerte(s)
+            {counts.transactions} transaction(s), {counts.watchlist} favori(s), {counts.alerts} alerte(s), {counts.readings} relevé(s) de dominance
           </dd>
           <dt>Dernière sauvegarde</dt>
           <dd>{lastBackupAt ? fmtDayTime(lastBackupAt) : "jamais dans cette session"}</dd>
@@ -4492,11 +4813,12 @@ function SettingsView({ settings, onCurrency, onTheme, market, onSync, rateLimit
 /* ─────────────────────────── Application ─────────────────────────── */
 
 export default function RegistreCrypto() {
-  const [initial] = useState(() => ({ transactions: [], watchlist: [], alerts: [] }));
+  const [initial] = useState(() => ({ transactions: [], watchlist: [], alerts: [], domHistory: [] }));
   const [settings, setSettings] = useState(() => ({ currency: "EUR", theme: detectTheme() }));
   const [transactions, setTransactions] = useState(initial.transactions);
   const [watchlist, setWatchlist] = useState(initial.watchlist);
   const [alerts, setAlerts] = useState(initial.alerts);
+  const [domHistory, setDomHistory] = useState(initial.domHistory);
   const [saved, setSaved] = useState(() => ({ ...initial, at: null }));
   const [view, setView] = useState("portefeuille");
   const [period, setPeriod] = useState(30);
@@ -4607,6 +4929,21 @@ export default function RegistreCrypto() {
         const d = g.data && g.data.data;
         const pct = d && d.market_cap_percentage;
         if (pct && isNum(pct.btc)) {
+          if (!g.stale) {
+            const rot = computeRotation(next.coins, { btc: pct.btc }, null);
+            const reading = {
+              ts: g.ts,
+              btc: pct.btc,
+              ethBtc: rot && isNum(rot.ethBtc) ? rot.ethBtc : null,
+              share: rot && isNum(rot.share) ? rot.share : null,
+              source: "synchro",
+            };
+            setDomHistory((prev) => {
+              const lastSync = [...prev].reverse().find((r) => r.source === "synchro");
+              const base = lastSync && reading.ts - lastSync.ts < 15 * 60_000 ? prev.filter((r) => r !== lastSync) : prev;
+              return [...base, reading].sort((a, b) => a.ts - b.ts).slice(-DOMINANCE_HISTORY_MAX);
+            });
+          }
           setGlobalData({
             btc: pct.btc,
             eth: isNum(pct.eth) ? pct.eth : null,
@@ -4685,7 +5022,25 @@ export default function RegistreCrypto() {
   }, [market, currency]);
   const pricesReady = market.status !== "idle" && market.coins.length > 0 && market.currency === currency;
   const unsyncedIds = pricesReady && market.status !== "demo" ? trackedIds.filter((id) => !priceMap.has(id)) : [];
-  const rotation = useMemo(() => (market.coins.length ? computeRotation(market.coins, globalData) : null), [market.coins, globalData]);
+  const domWeekly = useMemo(() => dominanceWeeklySignal(domHistory), [domHistory]);
+  const rotation = useMemo(
+    () => (market.coins.length ? computeRotation(market.coins, globalData, domWeekly) : null),
+    [market.coins, globalData, domWeekly],
+  );
+  const addReading = useCallback(
+    ({ date, btc }) => {
+      const ts = isoToTs(date) + 12 * 3_600_000;
+      setDomHistory((prev) =>
+        [...prev.filter((r) => !(r.source === "manuel" && toISO(new Date(r.ts)) === date)), { ts, btc, ethBtc: null, share: null, source: "manuel" }]
+          .sort((a, b) => a.ts - b.ts)
+          .slice(-DOMINANCE_HISTORY_MAX),
+      );
+      pushToast({ kind: "success", title: "Relevé ajouté", body: `Dominance ${fmtPct(btc, false)} au ${fmtDate(date)}.` });
+    },
+    [pushToast],
+  );
+  const removeWeek = useCallback((week) => setDomHistory((prev) => prev.filter((r) => weekStart(r.ts) !== week)), []);
+  const clearHistory = useCallback(() => setDomHistory([]), []);
 
   const conv = useMemo(() => {
     const values = rates && rates.values;
@@ -4931,14 +5286,14 @@ export default function RegistreCrypto() {
       description: "Séparateur point-virgule, décimales à virgule, dates JJ/MM/AAAA, encodage UTF-8 : le fichier s'ouvre directement dans Excel.",
     });
   const exportJSON = () => {
-    const snapshot = { transactions, watchlist, alerts };
+    const snapshot = { transactions, watchlist, alerts, domHistory };
     setDialog({
       type: "export",
       title: "Exporter la sauvegarde (JSON)",
       filename: `registre-crypto-sauvegarde-${todayISO()}.json`,
-      content: buildBackup({ settings, ...snapshot }),
+      content: buildBackup({ settings, transactions, watchlist, alerts, dominanceHistory: domHistory }),
       mime: "application/json",
-      description: "Contient les transactions, la watchlist, les alertes et les paramètres. Réimportez ce fichier à la prochaine session.",
+      description: "Contient les transactions, la watchlist, les alertes, l'historique de la dominance et les paramètres. Réimportez ce fichier à la prochaine session.",
       onDone: () => setSaved({ ...snapshot, at: Date.now() }),
     });
   };
@@ -4968,7 +5323,7 @@ export default function RegistreCrypto() {
     const date = r.exportedAt && !Number.isNaN(Date.parse(r.exportedAt)) ? ` du ${fmtDayTime(Date.parse(r.exportedAt))}` : "";
     return {
       canImport: true,
-      summary: `Sauvegarde${date} : ${d.transactions.length} transaction(s), ${d.watchlist.length} favori(s), ${d.alerts.length} alerte(s).`,
+      summary: `Sauvegarde${date} : ${d.transactions.length} transaction(s), ${d.watchlist.length} favori(s), ${d.alerts.length} alerte(s), ${d.dominanceHistory.length} relevé(s) de dominance.`,
       notes: ["L'import remplace toutes les données actuelles de la session."],
       errors: [],
       payload: d,
@@ -4979,8 +5334,9 @@ export default function RegistreCrypto() {
     setTransactions(d.transactions);
     setWatchlist(d.watchlist);
     setAlerts(d.alerts);
+    setDomHistory(d.dominanceHistory);
     setSettings((s) => ({ ...s, ...d.settings }));
-    setSaved({ transactions: d.transactions, watchlist: d.watchlist, alerts: d.alerts, at: saved.at });
+    setSaved({ transactions: d.transactions, watchlist: d.watchlist, alerts: d.alerts, domHistory: d.dominanceHistory, at: saved.at });
     setDialog(null);
     pushToast({ kind: "success", title: "Sauvegarde restaurée", body: `${d.transactions.length} transaction(s), ${d.alerts.length} alerte(s).` });
   };
@@ -4999,8 +5355,9 @@ export default function RegistreCrypto() {
     pushToast({ kind: "info", title: "Données effacées", body: "Le registre, la watchlist et les alertes sont vides." });
   };
 
-  const dirty = transactions !== saved.transactions || watchlist !== saved.watchlist || alerts !== saved.alerts;
-  const hasData = transactions.length + watchlist.length + alerts.length > 0;
+  const dirty =
+    transactions !== saved.transactions || watchlist !== saved.watchlist || alerts !== saved.alerts || domHistory !== saved.domHistory;
+  const hasData = transactions.length + watchlist.length + alerts.length + domHistory.length > 0;
   const unsaved = dirty && hasData;
   const unseenAlerts = alerts.filter((a) => a.triggeredAt && !a.seen).length;
   const rateLimited = client.blockedKind() === "rate_limited";
@@ -5167,6 +5524,11 @@ export default function RegistreCrypto() {
                 sentiment={sentiment}
                 rotation={rotation}
                 global={globalData}
+                domHistory={domHistory}
+                domWeekly={domWeekly}
+                onAddReading={addReading}
+                onRemoveWeek={removeWeek}
+                onClearHistory={clearHistory}
               />
             )}
             {view === "alertes" && (
@@ -5194,7 +5556,7 @@ export default function RegistreCrypto() {
                 onReset={resetAll}
                 dirty={unsaved}
                 lastBackupAt={saved.at}
-                counts={{ transactions: transactions.length, watchlist: watchlist.length, alerts: alerts.length }}
+                counts={{ transactions: transactions.length, watchlist: watchlist.length, alerts: alerts.length, readings: domHistory.length }}
               />
             )}
           </main>

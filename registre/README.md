@@ -63,6 +63,16 @@ Le panneau indique combien de ces trois signaux de rotation vers les altcoins so
 - ETH/BTC en hausse sur 30 jours ;
 - au moins 75 % des altcoins du top 50 devant le bitcoin.
 
+### Historique de la dominance
+
+L'API gratuite de CoinGecko ne fournit pas l'historique de la dominance : l'historique global est réservé aux offres payantes. Registre construit donc le sien :
+
+- **À chaque synchronisation réussie**, un relevé est enregistré : dominance, ratio ETH/BTC et part des altcoins devant le bitcoin. Un relevé de moins de 15 minutes est remplacé par le suivant. Rien n'est enregistré en mode démonstration.
+- **Saisie manuelle** : vous pouvez ajouter des clôtures passées (date et pourcentage), par exemple depuis TradingView (symbole BTC.D) ou CoinMarketCap. Un relevé saisi est daté de midi et remplace un relevé saisi le même jour.
+- **Clôture hebdomadaire** : c'est le dernier relevé de chaque semaine, du lundi au dimanche.
+- **Signal de dominance** : dès que les deux dernières semaines terminées ont chacune un relevé, il devient « sous 57 % sur 2 clôtures hebdomadaires ». Sinon, il repose sur la valeur actuelle et le panneau l'indique.
+- **Sauvegarde** : l'historique est conservé dans la sauvegarde JSON et restauré avec elle. Le panneau propose aussi un graphique avec le seuil de 57 % et le tableau des 12 dernières semaines.
+
 ## Seuils clés
 
 La fiche d'un actif calcule, sur un an de clôtures journalières (une requête à l'ouverture de la fiche, réutilisée ensuite pendant 6 h) :
