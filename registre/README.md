@@ -48,7 +48,20 @@ La force relative compare la variation de l'actif à celle du bitcoin sur la mê
 
 Si une mesure manque (actif récent), les poids sont renormalisés. Il faut au moins trois mesures pour obtenir un score. Les stablecoins ne sont pas notés. Les tranches affichées sont : faible (< 40), moyen (40–59), élevé (60–79) et très élevé (≥ 80). Le détail de chaque mesure est visible dans la fiche de l'actif : touchez son nom ou son score.
 
-Le sentiment global du marché (indice Fear & Greed, alternative.me) s'affiche au-dessus de la liste, à titre de contexte. Il n'entre pas dans le score.
+## Contexte du marché et signaux de rotation
+
+Au-dessus de la liste du marché, un panneau réunit quatre indicateurs :
+
+- **Dominance du bitcoin** : part du bitcoin dans la capitalisation totale, lue sur CoinGecko (`/global`). Sa variation sur 30 jours est estimée à partir du top 100, en supposant l'offre constante. En mode démonstration, la dominance est calculée sur le top 100.
+- **Ratio ETH/BTC**, avec sa variation sur 30 jours.
+- **Altcoins devant le bitcoin** : part des 50 premiers altcoins, hors stablecoins, qui ont fait mieux que le bitcoin sur 30 jours. L'indice public d'altseason mesure la même chose sur 90 jours.
+- **Sentiment du marché** : indice Fear & Greed (alternative.me), à titre de contexte. Il n'entre pas dans le score.
+
+Le panneau indique combien de ces trois signaux de rotation vers les altcoins sont réunis (seuils indicatifs) :
+
+- dominance sous 57 % ;
+- ETH/BTC en hausse sur 30 jours ;
+- au moins 75 % des altcoins du top 50 devant le bitcoin.
 
 ## Seuils clés
 
@@ -75,7 +88,7 @@ date;type;actif_id;symbole;nom;quantite;prix_unitaire;frais;devise;note
 
 Aucune requête ne part sans action de l'utilisateur : ni à l'ouverture de la page, ni à intervalle régulier, ni au changement de devise.
 
-- **« Synchroniser »** (barre du haut, Paramètres, bannières) déclenche 1 à 3 requêtes CoinGecko : le top 100, les actifs suivis hors du top 100 et les taux de change si un montant est libellé dans une autre devise. Elle charge aussi l'indice Fear & Greed. Les alertes sont vérifiées à chaque synchronisation.
+- **« Synchroniser »** (barre du haut, Paramètres, bannières) déclenche 2 à 4 requêtes CoinGecko : le top 100, les données globales (dominance), les actifs suivis hors du top 100 et les taux de change si un montant est libellé dans une autre devise. Elle charge aussi l'indice Fear & Greed. Les alertes sont vérifiées à chaque synchronisation.
 - **Historique** : la courbe de valeur ne se charge qu'après un clic sur « Charger l'évolution » ou sur une période. Elle se recharge ensuite si vous ajoutez une transaction sur un nouvel actif. La fiche d'un actif charge un an d'historique à son ouverture. Les historiques déjà reçus sont réutilisés sans nouvelle requête.
 - **Recherche** hors du top 100 : une requête par clic sur « Rechercher sur CoinGecko ».
 

@@ -75,6 +75,7 @@ const PATHS = {
   search: (q) => `/search?query=${encodeURIComponent(q)}`,
   sentiment: "https://api.alternative.me/fng/?limit=1",
   rates: () => "/exchange_rates",
+  global: () => "/global",
 };
 
 /* ─────────────────────────── Formats (fr-FR) ─────────────────────────── */
@@ -590,6 +591,52 @@ function computeKeyLevels(points, current, ath) {
     supports: supports.map((z) => z.mean),
     resistances: resistances.map((z) => z.mean),
     series: points.map((p, i) => ({ t: p[0], v: p[1], ma200: ma200[i] })),
+  };
+}
+
+/* ─────────────────────────── Contexte de marché : rotation vers les altcoins ─────────────────────────── */
+
+// Seuils indicatifs des trois signaux de rotation.
+const ROTATION = { dominanceMax: 57, shareMin: 75, altCount: 50 };
+
+/**
+ * Dominance du bitcoin (CoinGecko /global si disponible, sinon calculée sur le top 100),
+ * tendance de la dominance sur 30 jours estimée à partir du top 100 (offre supposée constante),
+ * ratio ETH/BTC et part des altcoins du top 50 (hors stablecoins) qui font mieux que le bitcoin sur 30 jours.
+ */
+function computeRotation(coins, global) {
+  const btc = coins.find((c) => c.id === "bitcoin");
+  if (!btc || !isNum(btc.mcap)) return null;
+  const eth = coins.find((c) => c.id === "ethereum");
+  const ranked = coins.filter((c) => isNum(c.mcap) && c.mcap > 0);
+  const mcap30 = (c) => (isNum(c.change30d) && c.change30d > -100 ? c.mcap / (1 + c.change30d / 100) : c.mcap);
+  const domTopNow = (btc.mcap / sum(ranked, (c) => c.mcap)) * 100;
+  const domTop30 = (mcap30(btc) / sum(ranked, mcap30)) * 100;
+  const fromGlobal = global && isNum(global.btc);
+  const dominance = fromGlobal ? global.btc : domTopNow;
+  const ethBtc = eth && isNum(eth.price) && isNum(btc.price) && btc.price > 0 ? eth.price / btc.price : null;
+  const ethBtc30 = eth ? relChange(eth.change30d, btc.change30d) : null;
+  const alts = coins
+    .filter((c) => c.id !== "bitcoin" && !c.stable && isNum(c.change30d))
+    .sort((a, b) => (a.rank || 1e9) - (b.rank || 1e9))
+    .slice(0, ROTATION.altCount);
+  const beating = alts.filter((c) => relChange(c.change30d, btc.change30d) > 0).length;
+  const share = alts.length ? (beating / alts.length) * 100 : null;
+  const signals = [
+    { key: "dominance", label: `Dominance du bitcoin sous ${ROTATION.dominanceMax} %`, met: dominance < ROTATION.dominanceMax },
+    { key: "ethbtc", label: "ETH/BTC en hausse sur 30 jours", met: isNum(ethBtc30) && ethBtc30 > 0 },
+    { key: "share", label: `Au moins ${ROTATION.shareMin} % des altcoins du top ${ROTATION.altCount} devant le bitcoin`, met: isNum(share) && share >= ROTATION.shareMin },
+  ];
+  return {
+    dominance,
+    fromGlobal,
+    domTrend: domTopNow - domTop30,
+    ethBtc,
+    ethBtc30,
+    share,
+    altCount: alts.length,
+    signals,
+    met: signals.filter((x) => x.met).length,
   };
 }
 
@@ -1710,8 +1757,17 @@ button.rc-score:hover{filter:brightness(.94)}
 .rc-ladder .rc-lvl-val small{display:block;color:var(--muted);font-size:11.5px;font-weight:500}
 .rc-lvl-dot{width:10px;height:10px;border-radius:50%;flex:none}
 .rc-lvl-dot.support{background:var(--s3)}.rc-lvl-dot.resistance{background:var(--s2)}.rc-lvl-dot.moyenne{background:var(--ink-2)}.rc-lvl-dot.extreme{background:transparent;border:2px solid var(--muted)}
-.rc-sentiment{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 14px;border:1px solid var(--rule);border-radius:12px;background:var(--surface);font-size:13px}
-.rc-sentiment strong{font-size:18px;font-variant-numeric:tabular-nums}
+.rc-context{display:flex;flex-direction:column;gap:12px}
+.rc-context-head{display:flex;justify-content:space-between;align-items:baseline;gap:6px 12px;flex-wrap:wrap}
+.rc-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+@media (min-width:900px){.rc-stats{grid-template-columns:repeat(4,minmax(0,1fr))}}
+.rc-stat{display:flex;flex-direction:column;gap:3px;padding:10px 12px;border-radius:10px;background:var(--surface-2);min-width:0}
+.rc-stat-label{font-size:12px;color:var(--muted);font-weight:600}
+.rc-stat-value{font-size:18px;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.rc-stat-sub{font-size:12px;color:var(--ink-2)}
+.rc-signals{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center}
+.rc-signal{display:inline-flex;align-items:center;gap:5px;padding:3px 9px 3px 6px;border-radius:999px;font-size:12px;font-weight:600;background:var(--surface-3);color:var(--ink-2)}
+.rc-signal.on{background:var(--accent-soft);color:var(--accent)}
 .rc-gauge{position:relative;flex:1 1 140px;max-width:260px;height:6px;border-radius:3px;background:linear-gradient(90deg,var(--s2),var(--surface-3) 50%,var(--s1))}
 .rc-gauge i{position:absolute;top:-4px;width:4px;height:14px;border-radius:2px;background:var(--ink);transform:translateX(-50%)}
 @media (prefers-reduced-motion:reduce){.rc *,.rc *::before{animation:none!important;transition:none!important}}
@@ -3711,6 +3767,81 @@ function CoinSheet({ coin, currency, demo, starred, alerts, loadLevels, onToggle
 
 /* ─────────────────────────── Vue Marché ─────────────────────────── */
 
+function MarketContext({ rotation, global, sentiment, demo, currency }) {
+  if (!rotation) return null;
+  const fmtRatio = (v) => (isNum(v) ? nf({ maximumSignificantDigits: 4 }).format(v) : "—");
+  const trend = rotation.domTrend;
+  return (
+    <section className="rc-card rc-context" aria-labelledby="rc-context-title">
+      <div className="rc-context-head">
+        <h2 className="rc-card-title" id="rc-context-title">
+          Contexte du marché{demo ? " (simulé)" : ""}
+        </h2>
+        {global && isNum(global.totalMcap) && global.currency === currency && (
+          <span className="rc-footnote">
+            Capitalisation totale {fmtCompact(global.totalMcap, currency)}
+            {isNum(global.change24h) && <> · 24 h <Delta value={global.change24h} /></>}
+          </span>
+        )}
+      </div>
+      <div className="rc-stats">
+        <div className="rc-stat">
+          <span className="rc-stat-label">Dominance du bitcoin</span>
+          <span className="rc-stat-value">{fmtPct(rotation.dominance, false)}</span>
+          <span className="rc-stat-sub">
+            {rotation.fromGlobal ? "" : "Calculée sur le top 100 · "}
+            30 j : {isNum(trend) ? `${trend > 0 ? "+" : trend < 0 ? "−" : ""}${nf({ minimumFractionDigits: 1, maximumFractionDigits: 1 }).format(Math.abs(trend))} pt` : "—"}
+            {rotation.fromGlobal ? " (estimation sur le top 100)" : ""}
+          </span>
+        </div>
+        <div className="rc-stat">
+          <span className="rc-stat-label">Ratio ETH/BTC</span>
+          <span className="rc-stat-value">{fmtRatio(rotation.ethBtc)}</span>
+          <span className="rc-stat-sub">
+            30 j : <Delta value={rotation.ethBtc30} />
+          </span>
+        </div>
+        <div className="rc-stat">
+          <span className="rc-stat-label">Altcoins devant le bitcoin</span>
+          <span className="rc-stat-value">{isNum(rotation.share) ? `${Math.round(rotation.share)} %` : "—"}</span>
+          <span className="rc-stat-sub">du top {rotation.altCount} hors stablecoins, sur 30 jours</span>
+        </div>
+        <div className="rc-stat">
+          <span className="rc-stat-label">Sentiment (Fear &amp; Greed)</span>
+          {sentiment ? (
+            <>
+              <span className="rc-stat-value">
+                {sentiment.value} <span style={{ fontSize: 13, fontWeight: 600 }}>{sentiment.label}</span>
+              </span>
+              <span className="rc-gauge" aria-hidden="true" style={{ maxWidth: "none", marginTop: 6, flex: "none" }}>
+                <i style={{ left: `${sentiment.value}%` }} />
+              </span>
+            </>
+          ) : (
+            <span className="rc-stat-sub">Indisponible</span>
+          )}
+        </div>
+      </div>
+      <div className="rc-signals" role="list" aria-label="Signaux de rotation vers les altcoins">
+        <strong style={{ fontSize: 13 }}>
+          Signaux de rotation vers les altcoins : {rotation.met} sur {rotation.signals.length}
+        </strong>
+        {rotation.signals.map((x) => (
+          <span key={x.key} role="listitem" className={`rc-signal${x.met ? " on" : ""}`}>
+            <Icon name={x.met ? "check" : "x"} size={13} />
+            {x.label}
+            <span className="rc-sr">{x.met ? " : rempli" : " : non rempli"}</span>
+          </span>
+        ))}
+      </div>
+      <p className="rc-footnote">
+        Seuils indicatifs, à titre de repère. L'indice public d'altseason mesure la part des altcoins devant le bitcoin sur 90 jours ; cette mesure-ci
+        utilise 30 jours. Sources : CoinGecko, alternative.me.
+      </p>
+    </section>
+  );
+}
+
 const SORTS = {
   rank: { label: "Rang", get: (c) => c.rank, dir: 1 },
   name: { label: "Nom", get: (c) => norm(c.name), dir: 1 },
@@ -3802,7 +3933,7 @@ const MarketRow = memo(function MarketRow({ coin, currency, starred, onToggleSta
   );
 });
 
-function MarketView({ market, watchlist, directory, onToggleStar, onAlert, onOpen, onSync, unsyncedCount, remoteSearch, sentiment }) {
+function MarketView({ market, watchlist, directory, onToggleStar, onAlert, onOpen, onSync, unsyncedCount, remoteSearch, sentiment, rotation, global }) {
   const [tab, setTab] = useState("top");
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState({ key: "rank", dir: 1 });
@@ -3853,8 +3984,8 @@ function MarketView({ market, watchlist, directory, onToggleStar, onAlert, onOpe
       <div className="rc-empty">
         <h3>Cours non synchronisés</h3>
         <p>
-          La synchronisation avec CoinGecko se fait uniquement à votre demande : une requête pour le top 100, plus une pour les actifs que vous suivez
-          hors du top 100. Les cours, variations, mini-graphiques et scores d'opportunité s'affichent ensuite ici.
+          La synchronisation avec CoinGecko se fait uniquement à votre demande : une requête pour le top 100, une pour la dominance du bitcoin, plus
+          une pour les actifs que vous suivez hors du top 100. Les cours, scores d'opportunité et signaux de rotation s'affichent ensuite ici.
         </p>
         <button type="button" className="rc-btn primary" onClick={onSync}>
           <Icon name="refresh" size={16} /> Synchroniser les cours
@@ -3865,17 +3996,7 @@ function MarketView({ market, watchlist, directory, onToggleStar, onAlert, onOpe
 
   return (
     <>
-      {sentiment && (
-        <div className="rc-sentiment" role="group" aria-label="Sentiment global du marché">
-          <span className="rc-muted">Sentiment global du marché</span>
-          <strong>{sentiment.value}</strong>
-          <span>{sentiment.label}</span>
-          <span className="rc-gauge" aria-hidden="true">
-            <i style={{ left: `${sentiment.value}%` }} />
-          </span>
-          <span className="rc-footnote">Indice Fear &amp; Greed (alternative.me), 0 = peur extrême, 100 = avidité extrême</span>
-        </div>
-      )}
+      <MarketContext rotation={rotation} global={global} sentiment={sentiment} demo={market.status === "demo"} currency={market.currency} />
       <div className="rc-toolbar">
         <Segmented
           label="Liste affichée"
@@ -4322,7 +4443,7 @@ function SettingsView({ settings, onCurrency, onTheme, market, onSync, rateLimit
           <dt>Mode</dt>
           <dd>Manuel : aucune requête sans clic sur « Synchroniser »</dd>
           <dt>Requêtes par synchronisation</dt>
-          <dd>1 à 3 : top 100, actifs suivis hors top 100, taux de change si besoin</dd>
+          <dd>2 à 4 : top 100, dominance (données globales), actifs suivis hors top 100, taux de change si besoin</dd>
           <dt>Historique</dt>
           <dd>Chargé à la demande (courbe de valeur, fiche d'un actif), puis réutilisé</dd>
         </dl>
@@ -4385,6 +4506,7 @@ export default function RegistreCrypto() {
   const [toasts, setToasts] = useState([]);
   const [dialog, setDialog] = useState(null);
   const [sentiment, setSentiment] = useState(null);
+  const [globalData, setGlobalData] = useState(null);
   const [historyEnabled, setHistoryEnabled] = useState(false);
   const [, setWake] = useState(0);
 
@@ -4478,6 +4600,28 @@ export default function RegistreCrypto() {
         next = { status: "demo", currency: cur, coins: demoMarket(demoRef.current, cur), extras: [], updatedAt: Date.now(), error: err, refreshing: false };
       }
     }
+    // Données globales (dominance) : une requête de plus, sauf en mode démonstration.
+    if (next.status !== "demo") {
+      try {
+        const g = await client.request(PATHS.global());
+        const d = g.data && g.data.data;
+        const pct = d && d.market_cap_percentage;
+        if (pct && isNum(pct.btc)) {
+          setGlobalData({
+            btc: pct.btc,
+            eth: isNum(pct.eth) ? pct.eth : null,
+            totalMcap: d.total_market_cap && isNum(d.total_market_cap[ccy]) ? d.total_market_cap[ccy] : null,
+            change24h: isNum(d.market_cap_change_percentage_24h_usd) ? d.market_cap_change_percentage_24h_usd : null,
+            currency: cur,
+            ts: g.ts,
+          });
+        }
+      } catch (e) {
+        /* dominance indisponible : calculée sur le top 100 */
+      }
+    } else {
+      setGlobalData(null);
+    }
     if (fx) {
       if (next.status === "demo") {
         setRates((r) => (r && r.source === "live" ? r : { values: DEMO_FX, source: "demo" }));
@@ -4541,6 +4685,7 @@ export default function RegistreCrypto() {
   }, [market, currency]);
   const pricesReady = market.status !== "idle" && market.coins.length > 0 && market.currency === currency;
   const unsyncedIds = pricesReady && market.status !== "demo" ? trackedIds.filter((id) => !priceMap.has(id)) : [];
+  const rotation = useMemo(() => (market.coins.length ? computeRotation(market.coins, globalData) : null), [market.coins, globalData]);
 
   const conv = useMemo(() => {
     const values = rates && rates.values;
@@ -5020,6 +5165,8 @@ export default function RegistreCrypto() {
                 unsyncedCount={unsyncedIds.length}
                 remoteSearch={remoteSearch}
                 sentiment={sentiment}
+                rotation={rotation}
+                global={globalData}
               />
             )}
             {view === "alertes" && (
