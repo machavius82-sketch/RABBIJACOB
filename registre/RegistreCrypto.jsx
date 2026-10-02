@@ -369,7 +369,7 @@ function normalizeCoin(c) {
     rsi: rsiFromHourly(hourly),
     spark: downsample(hourly, 42).map((v) => ({ v })),
   };
-  return withScore(coin);
+  return coin;
 }
 const normalizeList = (data) => (Array.isArray(data) ? data.filter((c) => c && c.id).map(normalizeCoin) : []);
 
@@ -414,11 +414,17 @@ function isStablecoin(c) {
 // Ramène x linéairement sur 0–100 entre a (0 point) et b (100 points).
 const toPoints = (x, a, b) => Math.max(0, Math.min(100, ((x - a) / (b - a)) * 100));
 
+// Variation relative de l'actif face au bitcoin sur la même période (en %).
+const relChange = (a, b) => (isNum(a) && isNum(b) && b > -100 ? ((1 + a / 100) / (1 + b / 100) - 1) * 100 : null);
+
+// Deux profils : « btc » (le bitcoin lui-même) et « alt » (tout autre actif noté).
+// Pour un altcoin, une forte décote est souvent celle d'un projet en déclin : la force relative
+// face au bitcoin prend le relais et la décote pèse moins.
 const SCORE_PARTS = [
   {
     key: "ath",
     label: "Décote sous le plus haut historique",
-    weight: 0.3,
+    weights: { btc: 0.3, alt: 0.15 },
     get: (c) => c.athChange,
     points: (v) => toPoints(-v, 0, 80),
     rule: "0 point au plus haut historique, 100 points à −80 % ou plus bas.",
@@ -426,7 +432,7 @@ const SCORE_PARTS = [
   {
     key: "pullback",
     label: "Repli sur 30 jours",
-    weight: 0.25,
+    weights: { btc: 0.25, alt: 0.2 },
     get: (c) => c.change30d,
     points: (v) => toPoints(20 - v, 0, 50),
     rule: "0 point après +20 % ou plus, 100 points après −30 % ou plus.",
@@ -434,7 +440,7 @@ const SCORE_PARTS = [
   {
     key: "trend",
     label: "Tendance de fond sur 200 jours",
-    weight: 0.2,
+    weights: { btc: 0.2, alt: 0.15 },
     get: (c) => c.change200d,
     points: (v) => toPoints(v, -50, 50),
     rule: "0 point à −50 % ou moins, 100 points à +50 % ou plus : pénalise les baisses durables.",
@@ -442,10 +448,28 @@ const SCORE_PARTS = [
   {
     key: "rsi",
     label: "Survente court terme (RSI 14, bougies 4 h)",
-    weight: 0.25,
+    weights: { btc: 0.25, alt: 0.2 },
     get: (c) => c.rsi,
     points: (v) => toPoints(70 - v, 0, 40),
     rule: "0 point à RSI 70 ou plus (suracheté), 100 points à RSI 30 ou moins (survendu).",
+  },
+  {
+    key: "relative",
+    label: "Force relative face au bitcoin (200 j et 30 j)",
+    weights: { btc: 0, alt: 0.3 },
+    get: (c, btc) => {
+      if (!btc) return null;
+      const r200 = relChange(c.change200d, btc.change200d);
+      const r30 = relChange(c.change30d, btc.change30d);
+      return r200 == null && r30 == null ? null : { r200, r30 };
+    },
+    points: (v) => {
+      const pts = [];
+      if (v.r200 != null) pts.push(toPoints(v.r200, -50, 50));
+      if (v.r30 != null) pts.push(toPoints(v.r30, -20, 20));
+      return sum(pts) / pts.length;
+    },
+    rule: "Moyenne de deux échelles : sur 200 jours, 0 point à 50 % de moins bien que le bitcoin et 100 points à 50 % de mieux ; sur 30 jours, de −20 % à +20 %.",
   },
 ];
 const SCORE_BANDS = [
@@ -459,22 +483,29 @@ const SCORE_BANDS = [
  * Score 0–100 : moyenne pondérée de mesures ramenées sur 100
  * (poids renormalisés si une mesure manque ; au moins 3 mesures requises).
  */
-function computeScore(c) {
+function computeScore(c, btc) {
   if (c.stable) return { total: null, reason: "Stablecoin : cours indexé sur une monnaie, non noté.", parts: [] };
-  const parts = SCORE_PARTS.map((p) => {
-    const raw = p.get(c);
-    return { key: p.key, label: p.label, weight: p.weight, rule: p.rule, raw: isNum(raw) ? raw : null, points: isNum(raw) ? p.points(raw) : null };
+  const profile = c.id === "bitcoin" ? "btc" : "alt";
+  const parts = SCORE_PARTS.filter((p) => p.weights[profile] > 0).map((p) => {
+    const raw = p.get(c, btc);
+    const ok = raw != null && (typeof raw === "object" || isNum(raw));
+    return { key: p.key, label: p.label, weight: p.weights[profile], rule: p.rule, raw: ok ? raw : null, points: ok ? p.points(raw) : null };
   });
   const avail = parts.filter((p) => p.points != null);
-  if (avail.length < 3) return { total: null, reason: "Historique insuffisant pour calculer le score.", parts };
+  if (avail.length < 3) return { total: null, reason: "Historique insuffisant pour calculer le score.", parts, profile };
   const weight = sum(avail, (p) => p.weight);
   const total = Math.round(sum(avail, (p) => p.points * p.weight) / weight);
-  return { total, band: SCORE_BANDS.find((b) => total >= b.min), parts, weight };
+  return { total, band: SCORE_BANDS.find((b) => total >= b.min), parts, weight, profile };
 }
-function withScore(coin) {
+function withScore(coin, btc) {
   const c = { ...coin, stable: isStablecoin(coin) };
-  c.score = computeScore(c);
+  c.score = computeScore(c, btc);
   return c;
+}
+/** Note une liste ; le bitcoin de référence est celui de la liste, sauf s'il est fourni. */
+function scoreList(list, btcRef) {
+  const btc = btcRef || list.find((c) => c.id === "bitcoin") || null;
+  return list.map((c) => withScore(c, btc));
 }
 
 function rollingMean(values, k) {
@@ -644,14 +675,14 @@ function advanceDemo(state) {
 }
 function demoMarket(state, cur) {
   const fx = DEMO_FX[cur.toLowerCase()] || 1;
-  return state.coins
+  const list = state.coins
     .map((c) => {
       const s = c.series;
       const last = s[s.length - 1];
       const r = mulberry32(hashStr(`${c.id}:meta`));
       const calm = c.vol < 0.001;
       const athChange = calm ? -0.4 * r() : -(4 + r() * 78);
-      return withScore({
+      return {
         id: c.id,
         symbol: c.symbol,
         name: c.name,
@@ -668,10 +699,11 @@ function demoMarket(state, cur) {
         rank: 0,
         rsi: rsiFromHourly(s),
         spark: downsample(s, 42).map((v) => ({ v: v * fx })),
-      });
+      };
     })
     .sort((a, b) => b.mcap - a.mcap)
     .map((c, i) => ({ ...c, rank: i + 1 }));
+  return scoreList(list);
 }
 function demoHistory(state, id, days, cur) {
   const c = state.coins.find((x) => x.id === id);
@@ -3493,6 +3525,11 @@ function CoinSheet({ coin, currency, demo, starred, alerts, loadLevels, onToggle
   const partText = (p) => {
     if (p.raw == null) return "indisponible";
     if (p.key === "rsi") return `RSI ${Math.round(p.raw)}`;
+    if (p.key === "relative") {
+      return [p.raw.r200 != null ? `200 j : ${fmtPct(p.raw.r200)}` : null, p.raw.r30 != null ? `30 j : ${fmtPct(p.raw.r30)}` : null]
+        .filter(Boolean)
+        .join(" · ");
+    }
     if (p.key === "ath" && isNum(coin.ath)) {
       return `${fmtPct(p.raw)} (plus haut ${fmtPrice(coin.ath, currency)}${coin.athDate ? ` le ${fmtDate(coin.athDate.slice(0, 10))}` : ""})`;
     }
@@ -3536,7 +3573,10 @@ function CoinSheet({ coin, currency, demo, starred, alerts, loadLevels, onToggle
               <span className={`rc-score big b${score.band.id}`}>{score.total}</span>
               <div>
                 <strong>{score.band.label}</strong>
-                <p className="rc-help">sur 100 · moyenne pondérée de {score.parts.filter((p) => p.points != null).length} mesures</p>
+                <p className="rc-help">
+                  sur 100 · moyenne pondérée de {score.parts.filter((p) => p.points != null).length} mesures ·{" "}
+                  {score.profile === "btc" ? "pondération bitcoin" : "pondération altcoin (force relative face au bitcoin)"}
+                </p>
               </div>
             </div>
             <ul className="rc-parts">
@@ -4412,15 +4452,16 @@ export default function RegistreCrypto() {
     let next;
     try {
       const top = await client.request(PATHS.top(ccy));
-      const coins = normalizeList(top.data);
+      const coins = scoreList(normalizeList(top.data));
       if (!coins.length) throw new ApiError("parse", "Liste vide");
+      const btcRef = coins.find((c) => c.id === "bitcoin") || null;
       const known = new Set(coins.map((c) => c.id));
       const extraIds = ids.filter((id) => !known.has(id));
       let extras = [];
       if (extraIds.length) {
         try {
           const r = await client.request(PATHS.ids(ccy, extraIds));
-          extras = normalizeList(r.data);
+          extras = scoreList(normalizeList(r.data), btcRef);
         } catch (err) {
           const prev = liveRef.current.market;
           extras = prev.currency === cur ? prev.extras.filter((c) => extraIds.includes(c.id)) : [];

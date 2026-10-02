@@ -34,12 +34,17 @@ Ces calculs servent au suivi. Ils ne reproduisent pas la méthode fiscale franç
 
 Le score est un indicateur technique descriptif. Il résume la position du cours actuel par rapport à son historique, sans rien prédire. Il vient de la même requête CoinGecko que la liste de marché, donc sans appel supplémentaire. Chaque mesure est ramenée linéairement sur 100 points, puis pondérée :
 
-| Mesure | Poids | 0 point | 100 points |
-|---|---|---|---|
-| Décote sous le plus haut historique | 30 % | au plus haut | −80 % ou plus bas |
-| Repli sur 30 jours | 25 % | +20 % ou plus | −30 % ou plus |
-| Tendance de fond sur 200 jours | 20 % | −50 % ou moins | +50 % ou plus |
-| RSI 14 sur bougies de 4 h (7 derniers jours) | 25 % | RSI ≥ 70 | RSI ≤ 30 |
+Deux pondérations : une pour le bitcoin, une pour les altcoins. Pour un altcoin, une forte décote est souvent celle d'un projet en déclin : la décote pèse moins, et une mesure de force relative face au bitcoin prend le relais.
+
+| Mesure | Poids bitcoin | Poids altcoin | 0 point | 100 points |
+|---|---|---|---|---|
+| Décote sous le plus haut historique | 30 % | 15 % | au plus haut | −80 % ou plus bas |
+| Repli sur 30 jours | 25 % | 20 % | +20 % ou plus | −30 % ou plus |
+| Tendance de fond sur 200 jours | 20 % | 15 % | −50 % ou moins | +50 % ou plus |
+| RSI 14 sur bougies de 4 h (7 derniers jours) | 25 % | 20 % | RSI ≥ 70 | RSI ≤ 30 |
+| Force relative face au bitcoin | — | 30 % | 50 % de moins bien que le bitcoin sur 200 j (20 % sur 30 j) | 50 % de mieux sur 200 j (20 % sur 30 j) |
+
+La force relative compare la variation de l'actif à celle du bitcoin sur la même période, en faisant la moyenne de l'échelle 200 jours et de l'échelle 30 jours. Elle n'ajoute aucune requête : le bitcoin figure déjà dans la liste.
 
 Si une mesure manque (actif récent), les poids sont renormalisés. Il faut au moins trois mesures pour obtenir un score. Les stablecoins ne sont pas notés. Les tranches affichées sont : faible (< 40), moyen (40–59), élevé (60–79) et très élevé (≥ 80). Le détail de chaque mesure est visible dans la fiche de l'actif : touchez son nom ou son score.
 
